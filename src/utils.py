@@ -9,6 +9,8 @@ from pathlib import Path
 # === Third-Party ===
 import pandas as pd
 import matplotlib.pyplot as plt
+from pydantic import BaseModel
+from google.genai import types
 from PIL import Image  # (kept if you need it elsewhere)
 from dotenv import load_dotenv
 from google import genai
@@ -21,12 +23,20 @@ gemini_api_key = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=gemini_api_key) if gemini_api_key else genai.Client()
 
 
-def get_response(model: str, prompt: str) -> str:
-    """Call a Gemini model and return its text."""
+def get_response(model: str, prompt: str, response_schema: type[BaseModel] | None = None):
+    """Call a Gemini model and return its text or structured output."""
+    config = types.GenerateContentConfig()
+    if response_schema:
+        config.response_mime_type = "application/json"
+        config.response_schema = response_schema
+        
     response = client.models.generate_content(
         model=model,
         contents=prompt,
+        config=config
     )
+    if response_schema:
+        return response.parsed
     return response.text
     
 # === Data Loading ===
@@ -46,14 +56,7 @@ def make_schema_text(df: pd.DataFrame) -> str:
     """Return a human-readable schema from a DataFrame."""
     return "\n".join(f"- {c}: {dt}" for c, dt in df.dtypes.items())
 
-def ensure_execute_python_tags(text: str) -> str:
-    """Normalize code to be wrapped in <execute_python>...</execute_python>."""
-    text = text.strip()
-    # Strip ```python fences if present
-    text = re.sub(r"^```(?:python)?\s*|\s*```$", "", text).strip()
-    if "<execute_python>" not in text:
-        text = f"<execute_python>\n{text}\n</execute_python>"
-    return text
+
 
 def encode_image_b64(path: str) -> tuple[str, str]:
     """Return (media_type, base64_str) for an image file path."""
@@ -89,11 +92,19 @@ def print_html(content: Any, title: str | None = None, is_image: bool = False):
     
 
     
-def image_gemini_call(model_name: str, prompt: str, image_path: str) -> str:
+def image_gemini_call(model_name: str, prompt: str, image_path: str, response_schema: type[BaseModel] | None = None):
     from PIL import Image
     image = Image.open(image_path)
+    config = types.GenerateContentConfig()
+    if response_schema:
+        config.response_mime_type = "application/json"
+        config.response_schema = response_schema
+        
     response = client.models.generate_content(
         model=model_name,
-        contents=[image, prompt]
+        contents=[image, prompt],
+        config=config
     )
+    if response_schema:
+        return response.parsed
     return response.text

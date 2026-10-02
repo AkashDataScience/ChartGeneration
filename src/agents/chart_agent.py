@@ -2,18 +2,37 @@ import json
 import re
 import os
 import src.utils as utils
+from pydantic import BaseModel
 
-def generate_chart_code(instruction: str, model: str, out_path_v1: str) -> str:
+class ChartCodeResponse(BaseModel):
+    thought_process: str
+    python_code: str
+
+class ReflectionResponse(BaseModel):
+    critique: str
+    feedback: str
+    refined_code: str
+
+def generate_chart_code(instruction: str, model: str, out_path_v1: str, df, previous_code: str = "") -> tuple[str, str]:
     """Generate Python code to make a plot with matplotlib using tag-based wrapping."""
 
     prompt_path = os.path.join(os.path.dirname(__file__), "..", "prompts", "generation_prompt.txt")
     with open(prompt_path, "r", encoding="utf-8") as f:
         prompt_template = f.read()
         
-    prompt = prompt_template.format(instruction=instruction, out_path_v1=out_path_v1)
+    previous_code_section = ""
+    if previous_code:
+        previous_code_section = f"Here is the code you generated previously. Modify it to fulfill the new instruction:\n```python\n{previous_code}\n```"
 
-    response = utils.get_response(model, prompt)
-    return response
+    prompt = prompt_template.format(
+        instruction=instruction, 
+        out_path_v1=out_path_v1, 
+        schema=utils.make_schema_text(df),
+        previous_code_section=previous_code_section
+    )
+
+    response = utils.get_response(model, prompt, response_schema=ChartCodeResponse)
+    return response.thought_process, response.python_code
 
 
 def reflect_on_image_and_regenerate(
@@ -21,12 +40,13 @@ def reflect_on_image_and_regenerate(
     instruction: str,
     model_name: str,
     out_path_v2: str,
-    code_v1: str,  
-) -> tuple[str, str]:
+    code_v1: str,
+    df  
+) -> tuple[str, str, str]:
     """
     Critique the chart IMAGE and the original code against the instruction, 
     then return refined matplotlib code.
-    Returns (feedback, refined_code_with_tags).
+    Returns (critique, feedback, refined_code).
     Works with Gemini vision-capable models (e.g. gemini-2.5-flash).
     """
 
@@ -37,33 +57,33 @@ def reflect_on_image_and_regenerate(
     prompt = prompt_template.format(
         code_v1=code_v1,
         out_path_v2=out_path_v2,
-        instruction=instruction
+        instruction=instruction,
+        schema=utils.make_schema_text(df)
     )
 
-    # Send the chart image + prompt to the reflection model
-    content = utils.image_gemini_call(model_name, prompt, chart_path)
+    # Send the chart image + prompt to the reflection model and get structured response
+    structured_response = utils.image_gemini_call(
+        model_name, 
+        prompt, 
+        chart_path, 
+        response_schema=ReflectionResponse
+    )
 
-    # --- Parse ONLY the first JSON line (feedback) ---
-    lines = content.strip().splitlines()
-    json_line = lines[0].strip() if lines else ""
+    return structured_response.critique, structured_response.feedback, structured_response.refined_code
 
-    try:
-        obj = json.loads(json_line)
-    except Exception as e:
-        # Fallback: try to capture the first {...} in all the content
-        m_json = re.search(r"\{.*?\}", content, flags=re.DOTALL)
-        if m_json:
-            try:
-                obj = json.loads(m_json.group(0))
-            except Exception as e2:
-                obj = {"feedback": f"Failed to parse JSON: {e2}", "refined_code": ""}
-        else:
-            obj = {"feedback": f"Failed to find JSON: {e}", "refined_code": ""}
 
-    # --- Extract refined code from <execute_python>...</execute_python> ---
-    m_code = re.search(r"<execute_python>([\s\S]*?)</execute_python>", content)
-    refined_code_body = m_code.group(1).strip() if m_code else ""
-    refined_code = utils.ensure_execute_python_tags(refined_code_body)
+def fix_chart_code(instruction: str, bad_code: str, error_message: str, model: str, df) -> str:
+    """Ask the model to fix Python code that produced an error."""
+    prompt_path = os.path.join(os.path.dirname(__file__), "..", "prompts", "error_fix_prompt.txt")
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        prompt_template = f.read()
+        
+    prompt = prompt_template.format(
+        instruction=instruction, 
+        bad_code=bad_code, 
+        error_message=error_message,
+        schema=utils.make_schema_text(df)
+    )
 
-    feedback = str(obj.get("feedback", "")).strip()
-    return feedback, refined_code
+    response = utils.get_response(model, prompt, response_schema=ChartCodeResponse)
+    return response.python_code

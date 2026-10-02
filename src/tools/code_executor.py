@@ -1,11 +1,11 @@
-import re
+import traceback
 
-def execute_chart_code(code: str, df) -> str:
-    """Extracts python code from <execute_python> tags and runs it."""
-    match = re.search(r"<execute_python>([\s\S]*?)</execute_python>", code)
-    if match:
-        extracted_code = match.group(1).strip()
-        exec_globals = {"df": df}
-        exec(extracted_code, exec_globals)
-        return extracted_code
-    return ""
+def execute_chart_code(code: str, df) -> tuple[bool, str]:
+    """Runs the provided python code directly. Returns (success, error_msg)."""
+    exec_globals = {"df": df}
+    try:
+        exec(code, exec_globals)
+        return True, ""
+    except Exception as e:
+        error_msg = traceback.format_exc()
+        return False, error_msg

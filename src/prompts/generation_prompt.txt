@@ -1,23 +1,11 @@
 You are a data visualization expert.
 
-Return your answer *strictly* in this format:
 
-<execute_python>
-# valid python code here
-</execute_python>
 
-Do not add explanations, only the tags and the code.
+The code should create a visualization from a DataFrame 'df' with the following schema:
+{schema}
 
-The code should create a visualization from a DataFrame 'df' with these columns:
-- date   (datetime64 — already parsed; use df['date'].dt.year, df['date'].dt.month, etc.)
-- time   (string, HH:MM — do NOT concatenate or combine with the date column)
-- cash_type (string: 'card' or 'cash')
-- card (string)
-- price (number)
-- coffee_name (string)
-- quarter (int, 1–4 — already computed, use directly)
-- month  (int, 1–12 — already computed, use directly)
-- year   (int, e.g. 2024 — already computed, use directly)
+{previous_code_section}
 
 User instruction: {instruction}
 
@@ -29,11 +17,24 @@ Requirements for the code:
 5. Do not call plt.show().
 6. Close all plots with plt.close().
 7. Add all necessary import python statements
-8. CRITICAL: 'date' is datetime64 — never use string concatenation on it.
-   Filter by year/quarter using the 'year' and 'quarter' integer columns.
-9. CRITICAL: when aggregating (sum, mean, count, etc.), always select the numeric
-   column explicitly, e.g. df.groupby(['year', 'coffee_name'])['price'].sum().
-   Never call .sum() or .mean() on the whole DataFrame or on a groupby without
-   selecting a column — non-numeric columns like 'date' will raise a TypeError.
+8. CRITICAL: when aggregating (sum, mean, count, etc.), always select the numeric column explicitly, e.g. df.groupby(['year', 'coffee_name'])['price'].sum().
 
-Return ONLY the code wrapped in <execute_python> tags.
+Here is an example of the high-quality, aesthetic code you should aim to write:
+
+EXAMPLE 1 (Bar Chart):
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# Assume df is loaded
+df_agg = df[df['year'] == 2024].groupby('coffee_name')['price'].sum()
+plt.style.use('seaborn-v0_8-whitegrid')
+fig, ax = plt.subplots(figsize=(10, 6))
+bars = ax.bar(df_agg.index, df_agg.values, color='#4C72B0', edgecolor='none')
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+ax.set_title("Coffee Sales 2024", fontsize=16, fontweight='bold', pad=20)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.savefig('{out_path_v1}', dpi=300)
+plt.close()
+
