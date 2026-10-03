@@ -105,8 +105,28 @@ def with_retries(func):
                     raise e
     return wrapper
 
+def cast_tool_arguments(func_name: str, args_dict: dict, tools: list) -> dict:
+    """Dynamically cast arguments based on the tool's inputSchema to prevent LLM type hallucinations."""
+    target_tool = next((t for t in tools if t.name == func_name), None)
+    if target_tool and hasattr(target_tool, "inputSchema") and 'properties' in target_tool.inputSchema:
+        for param_name, param_info in target_tool.inputSchema['properties'].items():
+            if param_name in args_dict:
+                val = args_dict[param_name]
+                expected_type = param_info.get('type')
+                try:
+                    if expected_type == 'integer':
+                        args_dict[param_name] = int(val)
+                    elif expected_type == 'number':
+                        args_dict[param_name] = float(val)
+                    elif expected_type == 'array' and isinstance(val, str):
+                        import json
+                        args_dict[param_name] = json.loads(val)
+                except (ValueError, SyntaxError, TypeError):
+                    pass
+    return args_dict
+
 @with_retries
-async def run_agent_loop(model: str, messages: list, response_schema: type[BaseModel] | None = None, requested_resources: list[str] = None):
+async def run_agent_loop(model: str, mcp_prompt_name: str = None, mcp_prompt_args: dict = None, messages: list = None, response_schema: type[BaseModel] | None = None, requested_resources: list[str] = None):
     """Runs a recursive agent loop using OpenAI's tool calling API."""
 
     in_tok_total = 0
@@ -123,6 +143,11 @@ async def run_agent_loop(model: str, messages: list, response_schema: type[BaseM
         async with ClientSession(read, write) as session:
             await session.initialize()
             
+            if mcp_prompt_name:
+                mcp_prompt = await session.get_prompt(mcp_prompt_name, arguments=mcp_prompt_args or {})
+                prompt_text = mcp_prompt.messages[0].content.text
+                messages = [{"role": "user", "content": prompt_text}]
+
             if requested_resources:
                 resource_context = "\n[Available Resources from User]:\n"
                 for res in requested_resources:
@@ -131,7 +156,10 @@ async def run_agent_loop(model: str, messages: list, response_schema: type[BaseM
                         resource_context += f"Resource URI: file://{res}\nData:\n{data.contents[0].text}\n"
                     except Exception as e:
                         resource_context += f"Failed to load resource {res}: {e}\n"
-                messages[0]["content"] += resource_context
+                if messages:
+                    messages[0]["content"] += resource_context
+                else:
+                    messages = [{"role": "user", "content": resource_context}]
 
             # Fetch tools dynamically from the MCP server
             mcp_tools_response = await session.list_tools()
@@ -175,6 +203,10 @@ async def run_agent_loop(model: str, messages: list, response_schema: type[BaseM
                         for tool_call in msg.tool_calls:
                             func_name = tool_call.function.name
                             func_args = json.loads(tool_call.function.arguments)
+                            
+                            # Cast arguments to prevent LLM hallucinations
+                            func_args = cast_tool_arguments(func_name, func_args, mcp_tools_response.tools)
+
                             # Better formatted logging
                             print(f"\n  \033[94m[Agent Action]\033[0m Calling tool: \033[1m{func_name}\033[0m")
                             for k, v in func_args.items():
@@ -263,15 +295,19 @@ async def run_agent_loop(model: str, messages: list, response_schema: type[BaseM
                             # Strip any potential proxy namespace prefixes
                             func_name = fc.name.split(":")[-1] if ":" in fc.name else fc.name
                             func_args = fc.args
-                            # Better formatted logging
-                            print(f"\n  \033[94m[Agent Action - Gemini]\033[0m Calling tool: \033[1m{func_name}\033[0m")
                             
                             # Convert proto MapComposite to standard dict if needed, else iterate directly
                             try:
                                 args_dict = dict(func_args)
                             except:
                                 args_dict = func_args
-                                
+
+                            # Cast arguments to prevent LLM hallucinations
+                            args_dict = cast_tool_arguments(func_name, args_dict, mcp_tools_response.tools)
+
+                            # Better formatted logging
+                            print(f"\n  \033[94m[Agent Action - Gemini]\033[0m Calling tool: \033[1m{func_name}\033[0m")
+                            
                             for k, v in args_dict.items():
                                 print(f"  \033[90m{k}:\033[0m")
                                 for line in str(v).split('\n'):
@@ -412,8 +448,8 @@ def print_html(content: Any, title: str | None = None, is_image: bool = False):
 
     
 @with_retries
-async def image_gemini_call(model_name: str, prompt: str, image_path: str, response_schema: type[BaseModel] | None = None, requested_resources: list[str] = None):
-    if requested_resources:
+async def image_gemini_call(model_name: str, mcp_prompt_name: str = None, mcp_prompt_args: dict = None, prompt: str = None, image_path: str = None, response_schema: type[BaseModel] | None = None, requested_resources: list[str] = None):
+    if requested_resources or mcp_prompt_name:
         server_params = StdioServerParameters(
             command=sys.executable,
             args=["src/mcp_server.py"],
@@ -422,14 +458,20 @@ async def image_gemini_call(model_name: str, prompt: str, image_path: str, respo
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                resource_context = "\n[Available Resources from User]:\n"
-                for res in requested_resources:
-                    try:
-                        data = await session.read_resource(f"file://{res}")
-                        resource_context += f"Resource URI: file://{res}\nData:\n{data.contents[0].text}\n"
-                    except Exception as e:
-                        resource_context += f"Failed to load resource {res}: {e}\n"
-                prompt += resource_context
+                
+                if mcp_prompt_name:
+                    mcp_prompt = await session.get_prompt(mcp_prompt_name, arguments=mcp_prompt_args or {})
+                    prompt = mcp_prompt.messages[0].content.text
+
+                if requested_resources:
+                    resource_context = "\n[Available Resources from User]:\n"
+                    for res in requested_resources:
+                        try:
+                            data = await session.read_resource(f"file://{res}")
+                            resource_context += f"Resource URI: file://{res}\nData:\n{data.contents[0].text}\n"
+                        except Exception as e:
+                            resource_context += f"Failed to load resource {res}: {e}\n"
+                    prompt = (prompt or "") + resource_context
 
     if model_name.startswith("gpt-") or model_name.startswith("llama") or model_name.startswith("mixtral") or model_name.startswith("openai/") or model_name.startswith("qwen/"):
         active_client = groq_client if not model_name.startswith("gpt-") or model_name.startswith("openai/") else openai_client

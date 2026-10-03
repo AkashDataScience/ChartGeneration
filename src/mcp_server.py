@@ -52,6 +52,91 @@ def read_local_file(filepath: str) -> str:
     except Exception as e:
         return f"Error reading file {filepath}: {str(e)}"
 
+@mcp.prompt()
+def generation_prompt(instruction: str, out_path_v1: str, previous_code_section: str = "") -> str:
+    return f"""You are a data visualization expert.
+
+The code should create a visualization based on the files requested in the context.
+
+{previous_code_section}
+
+User instruction: {instruction}
+
+Requirements for the code:
+1. Load the requested files manually using pandas (e.g., pd.read_csv('path')).
+2. Use matplotlib for plotting.
+3. Add clear title, axis labels, and legend if needed.
+4. Save the figure as '{out_path_v1}' with dpi=300.
+5. Do not call plt.show().
+6. Close all plots with plt.close().
+7. Add all necessary import python statements
+8. CRITICAL: when aggregating (sum, mean, count, etc.), always select the numeric column explicitly, e.g. df.groupby(['year', 'coffee_name'])['price'].sum().
+
+Here is an example of the high-quality, aesthetic code you should aim to write:
+
+EXAMPLE 1 (Bar Chart):
+import matplotlib.pyplot as plt
+import pandas as pd
+
+df = pd.read_csv('data/coffee_sales.csv')
+df_agg = df[df['year'] == 2024].groupby('coffee_name')['price'].sum()
+plt.style.use('seaborn-v0_8-whitegrid')
+fig, ax = plt.subplots(figsize=(10, 6))
+bars = ax.bar(df_agg.index, df_agg.values, color='#4C72B0', edgecolor='none')
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+ax.set_title("Coffee Sales 2024", fontsize=16, fontweight='bold', pad=20)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.savefig('{out_path_v1}', dpi=300)
+plt.close()
+"""
+
+
+@mcp.prompt()
+def reflection_prompt(instruction: str, out_path_v2: str, code_v1: str) -> str:
+    return f"""You are a data visualization expert.
+Your task: critique the attached chart and the original code against the given instruction,
+then return improved matplotlib code.
+
+Original code (for context):
+{code_v1}
+
+OUTPUT FORMAT (STRICT):
+Return the required structured output JSON containing the critique, feedback, and refined Python code.
+
+3) Import all necessary libraries in the code. Don't assume any imports from the original code.
+
+HARD CONSTRAINTS:
+- Use pandas/matplotlib only (no seaborn).
+- Load any requested files manually using pandas (e.g., pd.read_csv('path')).
+- Save to '{out_path_v2}' with dpi=300.
+- Always call plt.close() at the end (no plt.show()).
+- Include all necessary import statements.
+
+CRITICAL TYPE RULE: Always aggregate properly.
+
+Instruction:
+{instruction}
+"""
+
+
+@mcp.prompt()
+def error_fix_prompt(instruction: str, bad_code: str, error_message: str) -> str:
+    return f"""You are an expert Python data visualization debugger.
+You previously wrote code to fulfill this instruction:
+{instruction}
+
+However, when running the code, it produced the following error:
+{error_message}
+
+Here is the bad code you wrote:
+{bad_code}
+
+Please fix the error and return the corrected Python code.
+The code should use matplotlib, manually load any requested datasets based on context, and save the figure as required in the instruction. Do NOT call plt.show().
+"""
+
 if __name__ == "__main__":
     # Start the server on stdio (Standard Input/Output)
     mcp.run()
