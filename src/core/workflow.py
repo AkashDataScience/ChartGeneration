@@ -2,7 +2,7 @@ import src.utils as utils
 from src.agents.chart_agent import generate_chart_code, reflect_on_image_and_regenerate, fix_chart_code
 from src.tools.code_executor import execute_chart_code
 
-def execute_with_retries(code: str, df, instruction: str, model: str, max_retries: int = 3) -> tuple[str, int, int]:
+async def execute_with_retries(code: str, df, instruction: str, model: str, max_retries: int = 3) -> tuple[str, int, int]:
     current_code = code
     attempts = 0
     total_in = 0
@@ -13,7 +13,7 @@ def execute_with_retries(code: str, df, instruction: str, model: str, max_retrie
             return current_code, total_in, total_out
         
         utils.print_html(f"Execution failed with error. Retrying ({attempts+1}/{max_retries})...\nError Snippet: {error_msg[-200:]}")
-        current_code, in_tok, out_tok = fix_chart_code(instruction, current_code, error_msg, model, df)
+        current_code, in_tok, out_tok = await fix_chart_code(instruction, current_code, error_msg, model, df)
         total_in += in_tok
         total_out += out_tok
         attempts += 1
@@ -24,7 +24,7 @@ def execute_with_retries(code: str, df, instruction: str, model: str, max_retrie
         raise RuntimeError(f"Failed to execute code after {max_retries} retries.\nLast error: {error_msg}")
     return current_code, total_in, total_out
 
-def run_workflow(
+async def run_workflow(
     dataset_path: str,
     user_instructions: str,
     generation_model: str,
@@ -56,7 +56,7 @@ def run_workflow(
 
     # 1) Generate code (V1)
     utils.print_html("Step 1: Generating chart code (V1)… 📈")
-    thought_v1, code_v1, in_tok, out_tok = generate_chart_code(
+    thought_v1, code_v1, in_tok, out_tok = await generate_chart_code(
         instruction=user_instructions,
         model=generation_model,
         out_path_v1=out_v1,
@@ -70,7 +70,7 @@ def run_workflow(
 
     # 2) Execute V1 with ReAct Loop
     utils.print_html("Step 2: Executing chart code (V1) with ReAct Error Correction… 💻")
-    code_v1, in_tok, out_tok = execute_with_retries(code_v1, df, user_instructions, generation_model)
+    code_v1, in_tok, out_tok = await execute_with_retries(code_v1, df, user_instructions, generation_model)
     total_input_tokens += in_tok
     total_output_tokens += out_tok
     utils.print_html(code_v1, title="Final successful code (V1)")
@@ -78,7 +78,7 @@ def run_workflow(
 
     # 3) Reflect on V1 (image + original code) to get feedback and refined code (V2)
     utils.print_html("Step 3: Reflecting on V1 (image + code) and generating improvements… 🔁")
-    critique, feedback, code_v2, in_tok, out_tok = reflect_on_image_and_regenerate(
+    critique, feedback, code_v2, in_tok, out_tok = await reflect_on_image_and_regenerate(
         chart_path=out_v1,
         instruction=user_instructions,
         model_name=reflection_model,
@@ -94,7 +94,7 @@ def run_workflow(
 
     # 4) Execute V2 with ReAct Loop
     utils.print_html("Step 4: Executing refined chart code (V2) with ReAct Error Correction… 🖼️")
-    code_v2, in_tok, out_tok = execute_with_retries(code_v2, df, user_instructions, reflection_model)
+    code_v2, in_tok, out_tok = await execute_with_retries(code_v2, df, user_instructions, reflection_model)
     total_input_tokens += in_tok
     total_output_tokens += out_tok
     utils.print_html(code_v2, title="Final successful code (V2)")

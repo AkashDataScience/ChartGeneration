@@ -1,6 +1,7 @@
+import asyncio
 from src.core.workflow import run_workflow
 
-if __name__ == "__main__":
+async def main():
     generation_model = "gemini-3.5-flash"
     reflection_model = "gemini-3.5-flash"
     image_basename = "drink_sales"
@@ -17,7 +18,7 @@ if __name__ == "__main__":
             break
             
         print("\nStarting workflow...")
-        result = run_workflow(
+        result = await run_workflow(
             dataset_path=dataset_path,
             user_instructions=user_instructions,
             generation_model=generation_model,
@@ -29,3 +30,6 @@ if __name__ == "__main__":
         # Save the best code from this run to use as context for the next request
         previous_code = result.get("code_v2") or result.get("code_v1")
         print("\nWorkflow complete! You can view the image generated in your directory.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
