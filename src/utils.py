@@ -35,7 +35,9 @@ groq_client = AsyncOpenAI(
 import time
 import asyncio
 import json
-from src.tools.agent_tools import TOOLS_SCHEMA, TOOL_DISPATCH
+import sys
+from mcp.client.stdio import stdio_client, StdioServerParameters
+from mcp.client.session import ClientSession
 
 FALLBACK_MODELS = [
     "gemini-3.5-flash",
@@ -69,7 +71,12 @@ def with_retries(func):
             try:
                 return await func(*mutable_args, **kwargs)
             except Exception as e:
-                error_str = str(e)
+                def get_error_str(err):
+                    if hasattr(err, 'exceptions'):
+                        return " | ".join(get_error_str(sub_e) for sub_e in err.exceptions)
+                    return str(err)
+                error_str = get_error_str(e)
+                
                 if ("503" in error_str or "429" in error_str) and attempt < retries - 1:
                     print(f"\n[API Warning] Received {error_str[:60]}... on {current_model}")
                     
@@ -99,187 +106,221 @@ def with_retries(func):
     return wrapper
 
 @with_retries
-async def run_agent_loop(model: str, messages: list, response_schema: type[BaseModel] | None = None):
+async def run_agent_loop(model: str, messages: list, response_schema: type[BaseModel] | None = None, requested_resources: list[str] = None):
     """Runs a recursive agent loop using OpenAI's tool calling API."""
 
     in_tok_total = 0
     out_tok_total = 0
     
-    if model.startswith("gpt-") or model.startswith("llama") or model.startswith("mixtral") or model.startswith("openai/") or model.startswith("qwen/"):
-        # ==========================================
-        # OpenAI/Groq Tool Calling Loop
-        # ==========================================
-        active_client = groq_client if not model.startswith("gpt-") or model.startswith("openai/") else openai_client
-
-        while True:
-            # 1. Call LLM with tools
-            response = await active_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=TOOLS_SCHEMA,
-                tool_choice="auto"
-            )
-            msg = response.choices[0].message
-            in_tok_total += response.usage.prompt_tokens
-            out_tok_total += response.usage.completion_tokens
+    # 1. Setup the MCP Server Parameters
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["src/mcp_server.py"],
+        env=None
+    )
+    
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
             
-            # 2. Check if LLM wants to use a tool
-            if msg.tool_calls:
-                # Append the assistant's message exactly as it was returned
-                messages.append(msg)
+            if requested_resources:
+                resource_context = "\n[Available Resources from User]:\n"
+                for res in requested_resources:
+                    try:
+                        data = await session.read_resource(f"file://{res}")
+                        resource_context += f"Resource URI: file://{res}\nData:\n{data.contents[0].text}\n"
+                    except Exception as e:
+                        resource_context += f"Failed to load resource {res}: {e}\n"
+                messages[0]["content"] += resource_context
+
+            # Fetch tools dynamically from the MCP server
+            mcp_tools_response = await session.list_tools()
+            
+            # Convert MCP tools to OpenAI Schema
+            TOOLS_SCHEMA = []
+            for tool in mcp_tools_response.tools:
+                TOOLS_SCHEMA.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.inputSchema
+                    }
+                })
                 
-                # Execute all tool calls
-                for tool_call in msg.tool_calls:
-                    func_name = tool_call.function.name
-                    func_args = json.loads(tool_call.function.arguments)
-                    # Better formatted logging
-                    print(f"\n  \033[94m[Agent Action]\033[0m Calling tool: \033[1m{func_name}\033[0m")
-                    for k, v in func_args.items():
-                        print(f"  \033[90m{k}:\033[0m")
-                        for line in str(v).split('\n'):
-                            print(f"    \033[36m{line}\033[0m")
-                    
-                    if func_name in TOOL_DISPATCH:
-                        try:
-                            result = TOOL_DISPATCH[func_name](**func_args)
-                        except Exception as e:
-                            result = f"Tool execution failed: {str(e)}"
-                    else:
-                        result = f"Error: Tool {func_name} not found."
-                    
-                    print(f"  \033[92m[Agent Action]\033[0m Result generated.")
-                    
-                    # Append the result back to messages
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": func_name,
-                        "content": str(result)
-                    })
-                
-                # Loop repeats! LLM sees the tool results and decides what to do next.
-                continue
-                
-            else:
-                # 3. No more tool calls! Return final structured output
-                if response_schema:
-                    # To guarantee the Pydantic schema, do one final parse call
-                    # (You could also use strict Structured Outputs above, but keeping it split handles complex tool paths better)
-                    parse_response = await active_client.beta.chat.completions.parse(
+            if model.startswith("gpt-") or model.startswith("llama") or model.startswith("mixtral") or model.startswith("openai/") or model.startswith("qwen/"):
+                # ==========================================
+                # OpenAI/Groq Tool Calling Loop
+                # ==========================================
+                active_client = groq_client if not model.startswith("gpt-") or model.startswith("openai/") else openai_client
+        
+                while True:
+                    # 1. Call LLM with tools
+                    response = await active_client.chat.completions.create(
                         model=model,
                         messages=messages,
-                        response_format=response_schema
+                        tools=TOOLS_SCHEMA,
+                        tool_choice="auto"
                     )
-                    in_tok_total += parse_response.usage.prompt_tokens
-                    out_tok_total += parse_response.usage.completion_tokens
-                    return parse_response.choices[0].message.parsed, in_tok_total, out_tok_total
-                
-                return msg.content, in_tok_total, out_tok_total
-            
-    else:
-        # ==========================================
-        # Gemini Tool Calling Loop
-        # ==========================================
-        gemini_contents = []
-        for m in messages:
-            if m.get("role") == "user":
-                gemini_contents.append(types.Content(role="user", parts=[types.Part.from_text(text=m.get("content", ""))]))
-                
-        # Map the OpenAI TOOLS_SCHEMA into Gemini's format to avoid SDK automatic tool calling bugs
-        import copy
-        gemini_tools = copy.deepcopy(TOOLS_SCHEMA)
-        for t in gemini_tools:
-            if "strict" in t["function"]:
-                del t["function"]["strict"]
-            if "additionalProperties" in t["function"]["parameters"]:
-                del t["function"]["parameters"]["additionalProperties"]
-                
-        config = types.GenerateContentConfig(
-            tools=[{"function_declarations": [t["function"] for t in gemini_tools]}]
-        )
-        
-        while True:
-            response = await client.aio.models.generate_content(
-                model=model,
-                contents=gemini_contents,
-                config=config
-            )
-            
-            in_tok_total += response.usage_metadata.prompt_token_count if response.usage_metadata else 0
-            out_tok_total += response.usage_metadata.candidates_token_count if response.usage_metadata else 0
-            
-            if response.function_calls:
-                # ---------------------------------------------------------
-                # WORKAROUND: Bypassing GenAI SDK 'thought_signature' Bug
-                # The SDK drops the thought_signature field, breaking the proxy 
-                # if we send it back in history. Instead, we modify the original 
-                # user prompt with the tool results and restart the context!
-                # ---------------------------------------------------------
-                
-                tool_results_text = "\n\n[SYSTEM NOTE: The following tools were automatically executed on your behalf:\n"
-                for fc in response.function_calls:
-                    # Strip any potential proxy namespace prefixes
-                    func_name = fc.name.split(":")[-1] if ":" in fc.name else fc.name
-                    func_args = fc.args
-                    # Better formatted logging
-                    print(f"\n  \033[94m[Agent Action - Gemini]\033[0m Calling tool: \033[1m{func_name}\033[0m")
+                    msg = response.choices[0].message
+                    in_tok_total += response.usage.prompt_tokens
+                    out_tok_total += response.usage.completion_tokens
                     
-                    # Convert proto MapComposite to standard dict if needed, else iterate directly
-                    try:
-                        args_dict = dict(func_args)
-                    except:
-                        args_dict = func_args
+                    # 2. Check if LLM wants to use a tool
+                    if msg.tool_calls:
+                        # Append the assistant's message exactly as it was returned
+                        messages.append(msg)
                         
-                    for k, v in args_dict.items():
-                        print(f"  \033[90m{k}:\033[0m")
-                        for line in str(v).split('\n'):
-                            print(f"    \033[36m{line}\033[0m")
-                    
-                    if func_name in TOOL_DISPATCH:
-                        try:
-                            result = TOOL_DISPATCH[func_name](**func_args)
-                        except Exception as e:
-                            result = f"Tool execution failed: {str(e)}"
+                        # Execute all tool calls
+                        for tool_call in msg.tool_calls:
+                            func_name = tool_call.function.name
+                            func_args = json.loads(tool_call.function.arguments)
+                            # Better formatted logging
+                            print(f"\n  \033[94m[Agent Action]\033[0m Calling tool: \033[1m{func_name}\033[0m")
+                            for k, v in func_args.items():
+                                print(f"  \033[90m{k}:\033[0m")
+                                for line in str(v).split('\n'):
+                                    print(f"    \033[36m{line}\033[0m")
+                            
+                            try:
+                                # Forward tool call to MCP Server instead of running locally!
+                                mcp_result = await session.call_tool(func_name, arguments=func_args)
+                                result = mcp_result.content[0].text
+                            except Exception as e:
+                                result = f"Error: Tool {func_name} failed: {str(e)}"
+                            
+                            print(f"  \033[92m[Agent Action]\033[0m Result generated.")
+                            
+                            # Append the result back to messages
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": func_name,
+                                "content": str(result)
+                            })
+                        
+                        # Loop repeats! LLM sees the tool results and decides what to do next.
+                        continue
+                        
                     else:
-                        result = f"Error: Tool {func_name} not found."
+                        # 3. No more tool calls! Return final structured output
+                        if response_schema:
+                            # To guarantee the Pydantic schema, do one final parse call
+                            # (You could also use strict Structured Outputs above, but keeping it split handles complex tool paths better)
+                            parse_response = await active_client.beta.chat.completions.parse(
+                                model=model,
+                                messages=messages,
+                                response_format=response_schema
+                            )
+                            in_tok_total += parse_response.usage.prompt_tokens
+                            out_tok_total += parse_response.usage.completion_tokens
+                            return parse_response.choices[0].message.parsed, in_tok_total, out_tok_total
                         
-                    print(f"  \033[92m[Agent Action - Gemini]\033[0m Result generated.")
-                    tool_results_text += f"\n--- Result from {func_name} ---\n{str(result)}\n"
-                
-                tool_results_text += "Please continue fulfilling the original instruction using this new information.]\n"
-                
-                # Append the results directly to the user's original message
-                messages[-1]["content"] += tool_results_text
-                
-                # Rebuild gemini_contents from scratch to wipe out the broken model history
+                        return msg.content, in_tok_total, out_tok_total
+            
+            else:
+                # ==========================================
+                # Gemini Tool Calling Loop
+                # ==========================================
                 gemini_contents = []
                 for m in messages:
                     if m.get("role") == "user":
                         gemini_contents.append(types.Content(role="user", parts=[types.Part.from_text(text=m.get("content", ""))]))
+                        
+                # Map the OpenAI TOOLS_SCHEMA into Gemini's format to avoid SDK automatic tool calling bugs
+                import copy
+                gemini_tools = copy.deepcopy(TOOLS_SCHEMA)
+                for t in gemini_tools:
+                    if "strict" in t["function"]:
+                        del t["function"]["strict"]
+                    if "additionalProperties" in t["function"]["parameters"]:
+                        del t["function"]["parameters"]["additionalProperties"]
+                        
+                config = types.GenerateContentConfig(
+                    tools=[{"function_declarations": [t["function"] for t in gemini_tools]}]
+                )
                 
-                continue
-                
-            else:
-                # No more tool calls! Return final structured output
-                if response_schema:
-                    config_schema = types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=response_schema
-                    )
-                    # Force Gemini to map its final thoughts into the structured JSON schema
-                    gemini_contents.append(response.candidates[0].content)
-                    gemini_contents.append(types.Content(role="user", parts=[types.Part.from_text(text="Please output your final response exactly matching the requested JSON schema.")]))
-                    
-                    parse_response = await client.aio.models.generate_content(
+                while True:
+                    response = await client.aio.models.generate_content(
                         model=model,
                         contents=gemini_contents,
-                        config=config_schema
+                        config=config
                     )
-                    in_tok_total += parse_response.usage_metadata.prompt_token_count if parse_response.usage_metadata else 0
-                    out_tok_total += parse_response.usage_metadata.candidates_token_count if parse_response.usage_metadata else 0
-                    return parse_response.parsed, in_tok_total, out_tok_total
-                
-                return response.text, in_tok_total, out_tok_total
+                    
+                    in_tok_total += response.usage_metadata.prompt_token_count if response.usage_metadata else 0
+                    out_tok_total += response.usage_metadata.candidates_token_count if response.usage_metadata else 0
+                    
+                    if response.function_calls:
+                        # ---------------------------------------------------------
+                        # WORKAROUND: Bypassing GenAI SDK 'thought_signature' Bug
+                        # The SDK drops the thought_signature field, breaking the proxy 
+                        # if we send it back in history. Instead, we modify the original 
+                        # user prompt with the tool results and restart the context!
+                        # ---------------------------------------------------------
+                        
+                        tool_results_text = "\n\n[SYSTEM NOTE: The following tools were automatically executed on your behalf:\n"
+                        for fc in response.function_calls:
+                            # Strip any potential proxy namespace prefixes
+                            func_name = fc.name.split(":")[-1] if ":" in fc.name else fc.name
+                            func_args = fc.args
+                            # Better formatted logging
+                            print(f"\n  \033[94m[Agent Action - Gemini]\033[0m Calling tool: \033[1m{func_name}\033[0m")
+                            
+                            # Convert proto MapComposite to standard dict if needed, else iterate directly
+                            try:
+                                args_dict = dict(func_args)
+                            except:
+                                args_dict = func_args
+                                
+                            for k, v in args_dict.items():
+                                print(f"  \033[90m{k}:\033[0m")
+                                for line in str(v).split('\n'):
+                                    print(f"    \033[36m{line}\033[0m")
+                            
+                            try:
+                                # Forward tool call to MCP Server instead of running locally!
+                                mcp_result = await session.call_tool(func_name, arguments=args_dict)
+                                result = mcp_result.content[0].text
+                            except Exception as e:
+                                result = f"Error: Tool {func_name} failed: {str(e)}"
+                                
+                            print(f"  \033[92m[Agent Action - Gemini]\033[0m Result generated.")
+                            tool_results_text += f"\n--- Result from {func_name} ---\n{str(result)}\n"
+                        
+                        tool_results_text += "Please continue fulfilling the original instruction using this new information.]\n"
+                        
+                        # Append the results directly to the user's original message
+                        messages[-1]["content"] += tool_results_text
+                        
+                        # Rebuild gemini_contents from scratch to wipe out the broken model history
+                        gemini_contents = []
+                        for m in messages:
+                            if m.get("role") == "user":
+                                gemini_contents.append(types.Content(role="user", parts=[types.Part.from_text(text=m.get("content", ""))]))
+                        
+                        continue
+                        
+                    else:
+                        # No more tool calls! Return final structured output
+                        if response_schema:
+                            config_schema = types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                response_schema=response_schema
+                            )
+                            # Force Gemini to map its final thoughts into the structured JSON schema
+                            gemini_contents.append(response.candidates[0].content)
+                            gemini_contents.append(types.Content(role="user", parts=[types.Part.from_text(text="Please output your final response exactly matching the requested JSON schema.")]))
+                            
+                            parse_response = await client.aio.models.generate_content(
+                                model=model,
+                                contents=gemini_contents,
+                                config=config_schema
+                            )
+                            in_tok_total += parse_response.usage_metadata.prompt_token_count if parse_response.usage_metadata else 0
+                            out_tok_total += parse_response.usage_metadata.candidates_token_count if parse_response.usage_metadata else 0
+                            return parse_response.parsed, in_tok_total, out_tok_total
+                        
+                        return response.text, in_tok_total, out_tok_total
 
 @with_retries
 async def get_response(model: str, prompt: str, response_schema: type[BaseModel] | None = None):
@@ -371,7 +412,25 @@ def print_html(content: Any, title: str | None = None, is_image: bool = False):
 
     
 @with_retries
-async def image_gemini_call(model_name: str, prompt: str, image_path: str, response_schema: type[BaseModel] | None = None):
+async def image_gemini_call(model_name: str, prompt: str, image_path: str, response_schema: type[BaseModel] | None = None, requested_resources: list[str] = None):
+    if requested_resources:
+        server_params = StdioServerParameters(
+            command=sys.executable,
+            args=["src/mcp_server.py"],
+            env=None
+        )
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                resource_context = "\n[Available Resources from User]:\n"
+                for res in requested_resources:
+                    try:
+                        data = await session.read_resource(f"file://{res}")
+                        resource_context += f"Resource URI: file://{res}\nData:\n{data.contents[0].text}\n"
+                    except Exception as e:
+                        resource_context += f"Failed to load resource {res}: {e}\n"
+                prompt += resource_context
+
     if model_name.startswith("gpt-") or model_name.startswith("llama") or model_name.startswith("mixtral") or model_name.startswith("openai/") or model_name.startswith("qwen/"):
         active_client = groq_client if not model_name.startswith("gpt-") or model_name.startswith("openai/") else openai_client
         media_type, b64_image = encode_image_b64(image_path)

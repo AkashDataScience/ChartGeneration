@@ -1,8 +1,8 @@
 import traceback
 
-def execute_chart_code(code: str, df) -> tuple[bool, str]:
+def execute_chart_code(code: str) -> tuple[bool, str]:
     """Runs the provided python code directly. Returns (success, error_msg)."""
-    exec_globals = {"df": df}
+    exec_globals = {}
     try:
         exec(code, exec_globals)
         return True, ""

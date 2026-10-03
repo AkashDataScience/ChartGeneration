@@ -8,8 +8,5 @@ However, when running the code, it produced the following error:
 Here is the bad code you wrote:
 {bad_code}
 
-The dataframe 'df' has the following schema:
-{schema}
-
 Please fix the error and return the corrected Python code.
-The code should use matplotlib, assume 'df' DataFrame is already available in the environment, and save the figure as required in the instruction. Do NOT call plt.show().
+The code should use matplotlib, manually load any requested datasets based on context, and save the figure as required in the instruction. Do NOT call plt.show().

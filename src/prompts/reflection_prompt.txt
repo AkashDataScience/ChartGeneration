@@ -12,13 +12,10 @@ Return the required structured output JSON containing the critique, feedback, an
 
 HARD CONSTRAINTS:
 - Use pandas/matplotlib only (no seaborn).
-- Assume df already exists; do not read from files.
+- Load any requested files manually using pandas (e.g., pd.read_csv('path')).
 - Save to '{out_path_v2}' with dpi=300.
 - Always call plt.close() at the end (no plt.show()).
 - Include all necessary import statements.
-
-Schema (columns available in df):
-{schema}
 
 CRITICAL TYPE RULE: Always aggregate properly.
 

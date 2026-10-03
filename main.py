@@ -17,14 +17,20 @@ async def main():
         if user_instructions.strip().lower() in ['exit', 'quit']:
             break
             
+        # Parse @ file mentions
+        requested_resources = []
+        for word in user_instructions.split():
+            if word.startswith("@"):
+                requested_resources.append(word[1:])
+            
         print("\nStarting workflow...")
         result = await run_workflow(
-            dataset_path=dataset_path,
             user_instructions=user_instructions,
             generation_model=generation_model,
             reflection_model=reflection_model,
             image_basename=image_basename,
-            previous_code=previous_code
+            previous_code=previous_code,
+            requested_resources=requested_resources
         )
         
         # Save the best code from this run to use as context for the next request
