@@ -13,7 +13,7 @@ class ReflectionResponse(BaseModel):
     feedback: str
     refined_code: str
 
-def generate_chart_code(instruction: str, model: str, out_path_v1: str, df, previous_code: str = "") -> tuple[str, str]:
+def generate_chart_code(instruction: str, model: str, out_path_v1: str, df, previous_code: str = "") -> tuple[str, str, int, int]:
     """Generate Python code to make a plot with matplotlib using tag-based wrapping."""
 
     prompt_path = os.path.join(os.path.dirname(__file__), "..", "prompts", "generation_prompt.txt")
@@ -31,8 +31,8 @@ def generate_chart_code(instruction: str, model: str, out_path_v1: str, df, prev
         previous_code_section=previous_code_section
     )
 
-    response = utils.get_response(model, prompt, response_schema=ChartCodeResponse)
-    return response.thought_process, response.python_code
+    parsed, in_tok, out_tok = utils.get_response(model, prompt, response_schema=ChartCodeResponse)
+    return parsed.thought_process, parsed.python_code, in_tok, out_tok
 
 
 def reflect_on_image_and_regenerate(
@@ -42,7 +42,7 @@ def reflect_on_image_and_regenerate(
     out_path_v2: str,
     code_v1: str,
     df  
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, int, int]:
     """
     Critique the chart IMAGE and the original code against the instruction, 
     then return refined matplotlib code.
@@ -62,17 +62,17 @@ def reflect_on_image_and_regenerate(
     )
 
     # Send the chart image + prompt to the reflection model and get structured response
-    structured_response = utils.image_gemini_call(
+    parsed, in_tok, out_tok = utils.image_gemini_call(
         model_name, 
         prompt, 
         chart_path, 
         response_schema=ReflectionResponse
     )
 
-    return structured_response.critique, structured_response.feedback, structured_response.refined_code
+    return parsed.critique, parsed.feedback, parsed.refined_code, in_tok, out_tok
 
 
-def fix_chart_code(instruction: str, bad_code: str, error_message: str, model: str, df) -> str:
+def fix_chart_code(instruction: str, bad_code: str, error_message: str, model: str, df) -> tuple[str, int, int]:
     """Ask the model to fix Python code that produced an error."""
     prompt_path = os.path.join(os.path.dirname(__file__), "..", "prompts", "error_fix_prompt.txt")
     with open(prompt_path, "r", encoding="utf-8") as f:
@@ -85,5 +85,5 @@ def fix_chart_code(instruction: str, bad_code: str, error_message: str, model: s
         schema=utils.make_schema_text(df)
     )
 
-    response = utils.get_response(model, prompt, response_schema=ChartCodeResponse)
-    return response.python_code
+    parsed, in_tok, out_tok = utils.get_response(model, prompt, response_schema=ChartCodeResponse)
+    return parsed.python_code, in_tok, out_tok

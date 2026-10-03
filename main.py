@@ -1,8 +1,8 @@
 from src.core.workflow import run_workflow
 
 if __name__ == "__main__":
-    generation_model = "gemini-3.6-flash"
-    reflection_model = "gemini-3.6-flash"
+    generation_model = "gemini-3.5-flash"
+    reflection_model = "gemini-3.5-flash"
     image_basename = "drink_sales"
     dataset_path = "data/coffee_sales.csv"
 
