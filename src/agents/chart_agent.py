@@ -4,12 +4,23 @@ import os
 import src.utils as utils
 from pydantic import BaseModel, Field
 
+class CandidatePlan(BaseModel):
+    approach_name: str = Field(description="A short name for this approach (e.g., 'Bar Chart', 'Line Chart', 'Aggregated Table').")
+    steps: list[str] = Field(description="The steps required to execute this approach.")
+    pros: list[str] = Field(description="Advantages of this approach.")
+    cons: list[str] = Field(description="Disadvantages or risks of this approach.")
+
+class CodeDecomposition(BaseModel):
+    step_name: str = Field(description="Name of the execution step (e.g., 'Data Loading', 'Aggregation', 'Plotting').")
+    code_snippet: str = Field(description="The isolated Python code for this specific step.")
+
 class ChartCodeResponse(BaseModel):
     reasoning_type: str = Field(description="The type of reasoning used (e.g., 'data_exploration', 'code_generation', 'error_correction')")
-    step_by_step_plan: list[str] = Field(description="A sequential breakdown of the code generation strategy.")
-    internal_self_check: str = Field(description="A validation check evaluating whether the planned steps meet all hard constraints (e.g., using plt.close(), correct data aggregation).")
-    thought_process: str = Field(description="General explanation of the code logic.")
-    python_code: str = Field(description="The final valid Python code.")
+    candidate_plans: list[CandidatePlan] = Field(description="Provide at least 2 or 3 completely different approaches to solve the user's request.")
+    chosen_plan_name: str = Field(description="The approach_name of the best plan from your candidates.")
+    internal_self_check: str = Field(description="A validation check evaluating whether the chosen plan meets all hard constraints (e.g., using plt.close(), correct data aggregation).")
+    thought_process: str = Field(description="Explanation of why the chosen plan is better than the alternatives.")
+    decomposed_code_steps: list[CodeDecomposition] = Field(description="The final code broken down into distinct, sequential execution blocks.")
 
 class ReflectionResponse(BaseModel):
     reasoning_type: str = Field(description="The type of reasoning used (e.g., 'visual_evaluation', 'code_critique')")
@@ -41,11 +52,20 @@ async def generate_chart_code(instruction: str, model: str, out_path_v1: str, pr
     )
     
     full_thought = f"Reasoning Type: {parsed.reasoning_type}\n"
-    full_thought += f"Plan:\n" + "\n".join([f"  - {s}" for s in parsed.step_by_step_plan]) + "\n"
+    for plan in parsed.candidate_plans:
+        full_thought += f"\nCandidate: {plan.approach_name}\n"
+        full_thought += f"  Pros: {', '.join(plan.pros)}\n"
+        full_thought += f"  Cons: {', '.join(plan.cons)}\n"
+    full_thought += f"\nChosen Plan: {parsed.chosen_plan_name}\n"
     full_thought += f"Self Check: {parsed.internal_self_check}\n"
     full_thought += f"Thought Process: {parsed.thought_process}"
 
-    return full_thought, parsed.python_code, in_tok, out_tok
+    final_python_code = "\n\n".join([
+        f"# --- STEP: {step.step_name} ---\n{step.code_snippet}" 
+        for step in parsed.decomposed_code_steps
+    ])
+
+    return full_thought, final_python_code, in_tok, out_tok
 
 
 async def reflect_on_image_and_regenerate(
@@ -102,4 +122,10 @@ async def fix_chart_code(instruction: str, bad_code: str, error_message: str, mo
         mcp_prompt_args=mcp_prompt_args,
         response_schema=ChartCodeResponse
     )
-    return parsed.python_code, in_tok, out_tok
+    
+    final_python_code = "\n\n".join([
+        f"# --- STEP: {step.step_name} ---\n{step.code_snippet}" 
+        for step in parsed.decomposed_code_steps
+    ])
+    
+    return final_python_code, in_tok, out_tok

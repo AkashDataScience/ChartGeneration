@@ -39,6 +39,31 @@ def run_python_script(code: str) -> str:
     finally:
         sys.stdout = old_stdout
 
+@mcp.tool()
+def verify_pandas_logic(file_path: str, pandas_expression: str) -> str:
+    """
+    Verify a pandas data transformation (e.g., aggregation, filtering).
+    Provide the path to the CSV and an expression assuming the dataframe is named 'df'.
+    Example: df.groupby('coffee_name')['price'].sum()
+    """
+    try:
+        df = pd.read_csv(file_path)
+        # Safely evaluate the pandas expression
+        result = eval(pandas_expression, {"pd": pd, "df": df})
+        
+        output = f"Expression verified successfully!\n"
+        output += f"Type: {type(result)}\n"
+        
+        if isinstance(result, (pd.DataFrame, pd.Series)):
+            output += f"Shape: {result.shape}\n"
+            output += f"Head:\n{result.head().to_string()}\n"
+        else:
+            output += f"Value: {result}\n"
+            
+        return output
+    except Exception as e:
+        return f"Error verifying pandas logic: {str(e)}"
+
 @mcp.resource("file://{filepath}")
 def read_local_file(filepath: str) -> str:
     """Read a local file and return its contents or a sample if it's large."""
@@ -65,13 +90,15 @@ User instruction: {instruction}
 === YOUR WORKFLOW & MULTI-TURN CONVERSATION LOOP ===
 1. Separation of Tools: If you are unsure about the dataset structure, USE YOUR TOOLS first (e.g., get_dataset_columns, get_dataset_sample) to verify the data before writing code.
 2. Iterative Planning: When you receive tool results, incorporate that new information to revise your plan. If a requested file or column is missing, use your tools to search for alternatives or handle the error gracefully.
-3. Explicit Reasoning: Think step-by-step. Identify what reasoning type you are performing (e.g., data_exploration, code_generation).
-4. Structured Planning: Detail a step-by-step plan for your Python code. Update this plan dynamically if tool results require a pivot.
-5. Internal Self-Check: Before finalizing, verify:
+3. Intermediate Verification: Use the `verify_pandas_logic` tool to test your Pandas aggregations or filters BEFORE generating the final visualization code. Ensure the data shape and values are exactly what you expect to plot.
+4. Multi-Path Planning (Tree-of-Thoughts): Generate at least 2 different candidate approaches for how to process and visualize the data. Evaluate their pros and cons.
+5. Path Selection: Choose the best path based on the user's exact instructions and data constraints.
+6. Internal Self-Check: Before finalizing, verify:
    - Are you loading the requested files manually?
    - Are you closing the plots with plt.close() instead of plt.show()?
    - Are you selecting numeric columns explicitly during aggregations?
-6. Error Handling: If a tool returns an error, adjust your plan and try again.
+7. Error Handling: If a tool returns an error, adjust your plan and try again.
+8. Explicit Path Decomposition: Do not write the final Python script as one massive block. Break it down into isolated `decomposed_code_steps` (e.g., Data Loading, Filtering/Aggregation, Plotting).
 
 Requirements for the code:
 1. Load the requested files manually using pandas (e.g., pd.read_csv('path')).
@@ -156,6 +183,7 @@ Here is the bad code you wrote:
 3. Structured Planning: Formulate a step-by-step plan to fix the error.
 4. Internal Self-Check: Verify your proposed fix directly addresses the traceback without violating hard constraints (no plt.show(), must save figure, must include imports).
 5. Error Fallbacks: If you are unsure, write a robust try/except block or check the data structure again.
+6. Explicit Path Decomposition: Break the corrected code down into isolated `decomposed_code_steps` (e.g., Data Loading, Filtering, Plotting).
 
 Please fix the error and return the corrected Python code once your plan is ready.
 """
