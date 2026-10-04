@@ -106,10 +106,10 @@ def with_retries(func):
     return wrapper
 
 def cast_tool_arguments(func_name: str, args_dict: dict, tools: list) -> dict:
-    """Dynamically cast arguments based on the tool's inputSchema to prevent LLM type hallucinations."""
+    """Dynamically cast arguments based on the tool's input_schema to prevent LLM type hallucinations."""
     target_tool = next((t for t in tools if t.name == func_name), None)
-    if target_tool and hasattr(target_tool, "inputSchema") and 'properties' in target_tool.inputSchema:
-        for param_name, param_info in target_tool.inputSchema['properties'].items():
+    if target_tool and hasattr(target_tool, "input_schema") and 'properties' in target_tool.input_schema:
+        for param_name, param_info in target_tool.input_schema['properties'].items():
             if param_name in args_dict:
                 val = args_dict[param_name]
                 expected_type = param_info.get('type')
@@ -172,7 +172,7 @@ async def run_agent_loop(model: str, mcp_prompt_name: str = None, mcp_prompt_arg
                     "function": {
                         "name": tool.name,
                         "description": tool.description,
-                        "parameters": tool.inputSchema
+                        "parameters": tool.input_schema
                     }
                 })
                 

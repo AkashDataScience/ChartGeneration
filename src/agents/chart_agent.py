@@ -2,13 +2,19 @@ import json
 import re
 import os
 import src.utils as utils
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class ChartCodeResponse(BaseModel):
-    thought_process: str
-    python_code: str
+    reasoning_type: str = Field(description="The type of reasoning used (e.g., 'data_exploration', 'code_generation', 'error_correction')")
+    step_by_step_plan: list[str] = Field(description="A sequential breakdown of the code generation strategy.")
+    internal_self_check: str = Field(description="A validation check evaluating whether the planned steps meet all hard constraints (e.g., using plt.close(), correct data aggregation).")
+    thought_process: str = Field(description="General explanation of the code logic.")
+    python_code: str = Field(description="The final valid Python code.")
 
 class ReflectionResponse(BaseModel):
+    reasoning_type: str = Field(description="The type of reasoning used (e.g., 'visual_evaluation', 'code_critique')")
+    step_by_step_plan: list[str] = Field(description="A sequential breakdown of the required fixes based on the critique.")
+    internal_self_check: str = Field(description="A validation check ensuring the critique accurately reflects the chart image and original code.")
     critique: str
     feedback: str
     refined_code: str
@@ -33,7 +39,13 @@ async def generate_chart_code(instruction: str, model: str, out_path_v1: str, pr
         response_schema=ChartCodeResponse, 
         requested_resources=requested_resources
     )
-    return parsed.thought_process, parsed.python_code, in_tok, out_tok
+    
+    full_thought = f"Reasoning Type: {parsed.reasoning_type}\n"
+    full_thought += f"Plan:\n" + "\n".join([f"  - {s}" for s in parsed.step_by_step_plan]) + "\n"
+    full_thought += f"Self Check: {parsed.internal_self_check}\n"
+    full_thought += f"Thought Process: {parsed.thought_process}"
+
+    return full_thought, parsed.python_code, in_tok, out_tok
 
 
 async def reflect_on_image_and_regenerate(
@@ -67,7 +79,12 @@ async def reflect_on_image_and_regenerate(
         requested_resources=requested_resources
     )
 
-    return parsed.critique, parsed.feedback, parsed.refined_code, in_tok, out_tok
+    full_critique = f"Reasoning Type: {parsed.reasoning_type}\n"
+    full_critique += f"Plan:\n" + "\n".join([f"  - {s}" for s in parsed.step_by_step_plan]) + "\n"
+    full_critique += f"Self Check: {parsed.internal_self_check}\n"
+    full_critique += f"Critique: {parsed.critique}"
+
+    return full_critique, parsed.feedback, parsed.refined_code, in_tok, out_tok
 
 
 async def fix_chart_code(instruction: str, bad_code: str, error_message: str, model: str) -> tuple[str, int, int]:

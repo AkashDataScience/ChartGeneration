@@ -1,10 +1,10 @@
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 import pandas as pd
 import io
 import sys
 
 # Create the MCP Server instance
-mcp = FastMCP("ChartAgent Tools Server")
+mcp = MCPServer("ChartAgent Tools Server")
 
 @mcp.tool()
 def get_dataset_columns(file_path: str) -> str:
