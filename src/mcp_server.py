@@ -54,13 +54,24 @@ def read_local_file(filepath: str) -> str:
 
 @mcp.prompt()
 def generation_prompt(instruction: str, out_path_v1: str, previous_code_section: str = "") -> str:
-    return f"""You are a data visualization expert.
+    return f"""You are a data visualization expert capable of multi-step reasoning.
 
 The code should create a visualization based on the files requested in the context.
 
 {previous_code_section}
 
 User instruction: {instruction}
+
+=== YOUR WORKFLOW & MULTI-TURN CONVERSATION LOOP ===
+1. Separation of Tools: If you are unsure about the dataset structure, USE YOUR TOOLS first (e.g., get_dataset_columns, get_dataset_sample) to verify the data before writing code.
+2. Iterative Planning: When you receive tool results, incorporate that new information to revise your plan. If a requested file or column is missing, use your tools to search for alternatives or handle the error gracefully.
+3. Explicit Reasoning: Think step-by-step. Identify what reasoning type you are performing (e.g., data_exploration, code_generation).
+4. Structured Planning: Detail a step-by-step plan for your Python code. Update this plan dynamically if tool results require a pivot.
+5. Internal Self-Check: Before finalizing, verify:
+   - Are you loading the requested files manually?
+   - Are you closing the plots with plt.close() instead of plt.show()?
+   - Are you selecting numeric columns explicitly during aggregations?
+6. Error Handling: If a tool returns an error, adjust your plan and try again.
 
 Requirements for the code:
 1. Load the requested files manually using pandas (e.g., pd.read_csv('path')).
@@ -90,22 +101,29 @@ plt.xticks(rotation=45)
 plt.tight_layout()
 plt.savefig('{out_path_v1}', dpi=300)
 plt.close()
+Once you have completed your tools and planning, output your final result.
 """
 
 
 @mcp.prompt()
 def reflection_prompt(instruction: str, out_path_v2: str, code_v1: str) -> str:
-    return f"""You are a data visualization expert.
+    return f"""You are a data visualization expert capable of multi-step visual reasoning.
 Your task: critique the attached chart and the original code against the given instruction,
 then return improved matplotlib code.
 
 Original code (for context):
 {code_v1}
 
-OUTPUT FORMAT (STRICT):
-Return the required structured output JSON containing the critique, feedback, and refined Python code.
+=== YOUR WORKFLOW & MULTI-TURN CONVERSATION LOOP ===
+1. Separation of Tools: If you need to verify dataset columns to fix a bug, USE YOUR TOOLS first (e.g., get_dataset_columns).
+2. Iterative Planning: Incorporate tool results to dynamically revise your plan. If a requested file/column is missing, use tools to search for alternatives or handle the error gracefully.
+3. Explicit Reasoning: Think step-by-step about what is visually wrong with the chart or logically wrong with the code. Label your reasoning_type (e.g., visual_evaluation, code_critique).
+4. Structured Planning: Create a step-by-step plan detailing the fixes needed.
+5. Internal Self-Check: Verify that your critique accurately reflects both the image provided and the constraints requested.
+6. Error Fallbacks: If the image is unreadable or the code cannot be corrected with available context, output a robust try/except block or explain the limitation clearly in your feedback.
 
-3) Import all necessary libraries in the code. Don't assume any imports from the original code.
+OUTPUT FORMAT (STRICT):
+Once you have completed your tools and planning, output your final result.
 
 HARD CONSTRAINTS:
 - Use pandas/matplotlib only (no seaborn).
@@ -113,8 +131,7 @@ HARD CONSTRAINTS:
 - Save to '{out_path_v2}' with dpi=300.
 - Always call plt.close() at the end (no plt.show()).
 - Include all necessary import statements.
-
-CRITICAL TYPE RULE: Always aggregate properly.
+- CRITICAL TYPE RULE: Always aggregate properly.
 
 Instruction:
 {instruction}
@@ -123,7 +140,7 @@ Instruction:
 
 @mcp.prompt()
 def error_fix_prompt(instruction: str, bad_code: str, error_message: str) -> str:
-    return f"""You are an expert Python data visualization debugger.
+    return f"""You are an expert Python data visualization debugger capable of multi-step diagnostic reasoning.
 You previously wrote code to fulfill this instruction:
 {instruction}
 
@@ -133,8 +150,14 @@ However, when running the code, it produced the following error:
 Here is the bad code you wrote:
 {bad_code}
 
-Please fix the error and return the corrected Python code.
-The code should use matplotlib, manually load any requested datasets based on context, and save the figure as required in the instruction. Do NOT call plt.show().
+=== YOUR WORKFLOW ===
+1. Separation of Tools: If the error relates to a missing column or bad data type, use your tools (get_dataset_columns, get_dataset_sample) to inspect the data before guessing the fix.
+2. Explicit Reasoning: Think step-by-step to diagnose the traceback. Label your reasoning_type as error_correction.
+3. Structured Planning: Formulate a step-by-step plan to fix the error.
+4. Internal Self-Check: Verify your proposed fix directly addresses the traceback without violating hard constraints (no plt.show(), must save figure, must include imports).
+5. Error Fallbacks: If you are unsure, write a robust try/except block or check the data structure again.
+
+Please fix the error and return the corrected Python code once your plan is ready.
 """
 
 if __name__ == "__main__":
