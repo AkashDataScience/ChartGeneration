@@ -40,9 +40,8 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.session import ClientSession
 
 FALLBACK_MODELS = [
-    "gemini-3.5-flash",
+    "gemini-4-argon",
     "gemini-3.6-flash",
-    "gemini-3.7-flash",
     "gemini-3.8-flash",
     "gpt-4o-mini",
     "gpt-4o",
@@ -51,25 +50,145 @@ FALLBACK_MODELS = [
     "qwen/qwen3.8-27b"
 ]
 
+# Track models that hit quota/credit exhaustion so subsequent calls skip straight to a working model
+_EXHAUSTED_MODELS: set[str] = set()
+_LAST_WORKING_MODEL: str | None = None
+
+
+def sanitize_python_code(code: str) -> str:
+    """
+    Clean LLM-generated Python code:
+      1. Strip markdown code fences (```python ... ```).
+      2. Replace literal '\\n' and '\\t' sequences that appear OUTSIDE string literals/comments
+         (fixes `SyntaxError: unexpected character after line continuation character`).
+      3. Replace strict `format='%H:%M:%S'` time parsing with `format='mixed'` so `HH:MM`
+         strings do not become all-NaT and cause empty pivot/heatmap errors.
+    """
+    if not code:
+        return ""
+    cleaned = code.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:python|py)?\s*|\s*```$", "", cleaned, flags=re.DOTALL).strip()
+
+    # Walk character by character and unescape \n and \t only when outside quotes and comments
+    out = []
+    i = 0
+    n = len(cleaned)
+    in_str = None  # None, "'", '"', "'''", '"""'
+    in_comment = False
+
+    while i < n:
+        ch = cleaned[i]
+
+        if in_comment:
+            out.append(ch)
+            if ch == "\n":
+                in_comment = False
+            i += 1
+            continue
+
+        if in_str is not None:
+            if ch == "\\" and i + 1 < n:
+                out.append(ch)
+                out.append(cleaned[i + 1])
+                i += 2
+                continue
+            if cleaned.startswith(in_str, i):
+                out.append(in_str)
+                i += len(in_str)
+                in_str = None
+                continue
+            out.append(ch)
+            i += 1
+            continue
+
+        # Outside strings and comments
+        if ch == "#":
+            in_comment = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if cleaned.startswith("'''", i) or cleaned.startswith('"""', i):
+            in_str = cleaned[i:i + 3]
+            out.append(in_str)
+            i += 3
+            continue
+
+        if ch in ("'", '"'):
+            in_str = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        # Literal \n or \t outside of any string literal is invalid Python syntax
+        if ch == "\\" and i + 1 < n:
+            nxt = cleaned[i + 1]
+            if nxt == "n":
+                out.append("\n")
+                i += 2
+                continue
+            elif nxt == "t":
+                out.append("    ")
+                i += 2
+                continue
+
+        out.append(ch)
+        i += 1
+
+    result = "".join(out)
+    # Prevent `%H:%M:%S` from wiping out `HH:MM` time strings into NaT
+    result = re.sub(r"format\s*=\s*['\"]%H:%M:%S['\"]", "format='mixed'", result)
+    # Fix common matplotlib hallucination: `bold=True` -> `fontweight='bold'`
+    result = re.sub(r"\bbold\s*=\s*True\b", "fontweight='bold'", result)
+    return result
+
+
 def with_retries(func):
     async def wrapper(*args, **kwargs):
+        global _LAST_WORKING_MODEL
         mutable_args = list(args)
         
-        # Determine the current model
-        current_model = None
-        if mutable_args:
-            current_model = mutable_args[0]
-        elif 'model' in kwargs:
-            current_model = kwargs['model']
-        elif 'model_name' in kwargs:
-            current_model = kwargs['model_name']
-            
+        def _get_model():
+            if mutable_args:
+                return mutable_args[0]
+            if 'model' in kwargs:
+                return kwargs['model']
+            if 'model_name' in kwargs:
+                return kwargs['model_name']
+            return None
+
+        def _set_model(new_m: str):
+            if mutable_args:
+                mutable_args[0] = new_m
+            elif 'model' in kwargs:
+                kwargs['model'] = new_m
+            elif 'model_name' in kwargs:
+                kwargs['model_name'] = new_m
+
+        current_model = _get_model()
+
+        # If the requested model was already marked quota-exhausted in this session, jump to working model
+        if current_model in _EXHAUSTED_MODELS:
+            if _LAST_WORKING_MODEL and _LAST_WORKING_MODEL not in _EXHAUSTED_MODELS:
+                current_model = _LAST_WORKING_MODEL
+                _set_model(current_model)
+            else:
+                for candidate in FALLBACK_MODELS:
+                    if candidate not in _EXHAUSTED_MODELS:
+                        current_model = candidate
+                        _set_model(current_model)
+                        break
+
         retries = 10  # Give it a few attempts to cascade down the models
         backoff = 2
         
         for attempt in range(retries):
             try:
-                return await func(*mutable_args, **kwargs)
+                res = await func(*mutable_args, **kwargs)
+                if current_model:
+                    _LAST_WORKING_MODEL = current_model
+                return res
             except Exception as e:
                 def get_error_str(err):
                     if hasattr(err, 'exceptions'):
@@ -77,22 +196,26 @@ def with_retries(func):
                     return str(err)
                 error_str = get_error_str(e)
                 
-                if ("503" in error_str or "429" in error_str) and attempt < retries - 1:
-                    print(f"\n[API Warning] Received {error_str[:60]}... on {current_model}")
+                retryable_tokens = ("503", "429", "404", "413", "Request too large", "tool_use_failed", "json_validate_failed", "rate_limit")
+                if any(tok in error_str for tok in retryable_tokens) and attempt < retries - 1:
+                    print(f"\n[API Warning] Received {error_str[:80]}... on {current_model}")
+                    if any(q in error_str for q in ("429", "404", "no credits", "RESOURCE_EXHAUSTED")):
+                        _EXHAUSTED_MODELS.add(current_model)
                     
                     try:
-                        # Find the next model in the fallback list
+                        # Find the next non-exhausted model in the fallback list
                         current_idx = FALLBACK_MODELS.index(current_model)
-                        next_model = FALLBACK_MODELS[current_idx + 1]
+                        next_model = None
+                        for cand in FALLBACK_MODELS[current_idx + 1:]:
+                            if cand not in _EXHAUSTED_MODELS:
+                                next_model = cand
+                                break
+                        if next_model is None:
+                            next_model = FALLBACK_MODELS[current_idx + 1]
                         print(f"-> Falling back to {next_model} (Attempt {attempt+1}/{retries})")
                         
                         current_model = next_model
-                        if mutable_args:
-                            mutable_args[0] = current_model
-                        elif 'model' in kwargs:
-                            kwargs['model'] = current_model
-                        elif 'model_name' in kwargs:
-                            kwargs['model_name'] = current_model
+                        _set_model(current_model)
                             
                         # Brief pause to avoid spamming the API
                         await asyncio.sleep(1)
@@ -124,6 +247,150 @@ def cast_tool_arguments(func_name: str, args_dict: dict, tools: list) -> dict:
                 except (ValueError, SyntaxError, TypeError):
                     pass
     return args_dict
+
+
+def _try_salvage_failed_tool_call(err: Exception) -> tuple[str, dict] | None:
+    """
+    Attempt to recover tool name and arguments when an OpenAI/Groq model emits slightly
+    malformed JSON in a tool call (e.g. invalid escape like \\p instead of \\np, or trailing '"}"}').
+    """
+    failed_gen = None
+    if hasattr(err, "body") and isinstance(err.body, dict):
+        err_dict = err.body.get("error") or {}
+        if isinstance(err_dict, dict):
+            failed_gen = err_dict.get("failed_generation")
+
+    if not failed_gen:
+        m = re.search(r"'failed_generation':\s*'(.+?)'\s*\}", str(err), re.DOTALL)
+        if m:
+            try:
+                failed_gen = bytes(m.group(1), "utf-8").decode("unicode_escape")
+            except Exception:
+                failed_gen = m.group(1)
+
+    if not failed_gen or not isinstance(failed_gen, str):
+        return None
+
+    candidate = failed_gen.strip()
+    # Fix common trailing quote/brace hallucination: "}"} -> "}}
+    candidate = re.sub(r'"\s*\}\s*"\s*\}\s*$', '"}}', candidate)
+    # Fix invalid JSON backslash escapes (e.g. \pay_month where model dropped 'n' from \npay_month)
+    candidate_fixed_nl = re.sub(r'\\(?![/\"\\bfnrt]|u[0-9a-fA-F]{4})', r'\\n', candidate)
+
+    for attempt_str in (candidate, candidate_fixed_nl):
+        try:
+            data = json.loads(attempt_str)
+            if isinstance(data, dict) and "name" in data and "arguments" in data:
+                args = data["arguments"]
+                if isinstance(args, str):
+                    args = json.loads(args)
+                if isinstance(args, dict):
+                    return data["name"], args
+        except Exception:
+            continue
+    return None
+
+
+async def _parse_structured_openai_or_groq(
+    active_client,
+    model: str,
+    messages: list,
+    response_schema: type[BaseModel]
+) -> tuple[BaseModel, int, int]:
+    """
+    Parse final structured output. For OpenAI models, tries beta.chat.completions.parse first;
+    for Groq models (or on fallback), uses a compact single-turn json_object call with validation repair.
+    """
+    if active_client is openai_client:
+        try:
+            parse_response = await active_client.beta.chat.completions.parse(
+                model=model,
+                messages=messages,
+                response_format=response_schema
+            )
+            in_tok = parse_response.usage.prompt_tokens if parse_response.usage else 0
+            out_tok = parse_response.usage.completion_tokens if parse_response.usage else 0
+            return parse_response.choices[0].message.parsed, in_tok, out_tok
+        except Exception as parse_err:
+            print(f"  [Schema Parse Fallback] Strict parse failed on {model} ({str(parse_err)[:80]}). Falling back to JSON mode...")
+
+    schema_json = json.dumps(response_schema.model_json_schema(), indent=2)
+    base_user_prompt = ""
+    tool_summaries = []
+    last_assistant_text = ""
+
+    for m in messages:
+        if isinstance(m, dict):
+            role = m.get("role", "user")
+            content = str(m.get("content", ""))
+            if role == "user" and not base_user_prompt:
+                base_user_prompt = content[:18000]
+            elif role == "tool":
+                tool_summaries.append(f"[{m.get('name', 'tool')}]:\n{content[:1800]}")
+            elif role == "user" and "[SYSTEM NOTE:" in content:
+                tool_summaries.append(content[:1800])
+            elif role == "assistant" and content:
+                last_assistant_text = content[:3000]
+        else:
+            content = getattr(m, "content", None)
+            if content:
+                last_assistant_text = str(content)[:3000]
+
+    combined_context = base_user_prompt
+    if tool_summaries:
+        combined_context += "\n\n=== COLLECTED TOOL OUTPUTS ===\n" + "\n\n".join(tool_summaries[-5:])
+    if last_assistant_text:
+        combined_context += f"\n\n=== YOUR DRAFT ANALYSIS ===\n{last_assistant_text}"
+
+    flat_messages = [
+        {
+            "role": "user",
+            "content": (
+                f"{combined_context}\n\n"
+                "Now output your final response strictly as a single valid JSON object conforming "
+                "to the following JSON Schema (include all top-level keys, do not wrap in markdown fences):\n"
+                f"{schema_json}"
+            )
+        }
+    ]
+    fallback_resp = await active_client.chat.completions.create(
+        model=model,
+        messages=flat_messages,
+        response_format={"type": "json_object"}
+    )
+    raw_text = (fallback_resp.choices[0].message.content or "{}").strip()
+    if raw_text.startswith("```"):
+        raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.DOTALL).strip()
+    in_tok = fallback_resp.usage.prompt_tokens if fallback_resp.usage else 0
+    out_tok = fallback_resp.usage.completion_tokens if fallback_resp.usage else 0
+
+    try:
+        parsed_obj = response_schema.model_validate_json(raw_text)
+        return parsed_obj, in_tok, out_tok
+    except Exception as val_err:
+        print(f"  [Schema Repair] Fixing validation issue on {model}: {str(val_err)[:100]}...")
+        repair_messages = flat_messages + [
+            {"role": "assistant", "content": raw_text},
+            {
+                "role": "user",
+                "content": (
+                    f"Your JSON failed validation with:\n{val_err}\n\n"
+                    "Please return the corrected JSON object with all required fields populated."
+                )
+            }
+        ]
+        repair_resp = await active_client.chat.completions.create(
+            model=model,
+            messages=repair_messages,
+            response_format={"type": "json_object"}
+        )
+        repair_text = (repair_resp.choices[0].message.content or "{}").strip()
+        if repair_text.startswith("```"):
+            repair_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", repair_text, flags=re.DOTALL).strip()
+        in_tok += repair_resp.usage.prompt_tokens if repair_resp.usage else 0
+        out_tok += repair_resp.usage.completion_tokens if repair_resp.usage else 0
+        parsed_obj = response_schema.model_validate_json(repair_text)
+        return parsed_obj, in_tok, out_tok
 
 @with_retries
 async def run_agent_loop(model: str, mcp_prompt_name: str = None, mcp_prompt_args: dict = None, messages: list = None, response_schema: type[BaseModel] | None = None, requested_resources: list[str] = None):
@@ -181,18 +448,71 @@ async def run_agent_loop(model: str, mcp_prompt_name: str = None, mcp_prompt_arg
                 # OpenAI/Groq Tool Calling Loop
                 # ==========================================
                 active_client = groq_client if not model.startswith("gpt-") or model.startswith("openai/") else openai_client
+                tool_parse_retries = 0
         
                 while True:
-                    # 1. Call LLM with tools
-                    response = await active_client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        tools=TOOLS_SCHEMA,
-                        tool_choice="auto"
-                    )
+                    # 1. Call LLM with tools (with automatic recovery from malformed tool JSON)
+                    try:
+                        response = await active_client.chat.completions.create(
+                            model=model,
+                            messages=messages,
+                            tools=TOOLS_SCHEMA,
+                            tool_choice="auto"
+                        )
+                    except Exception as loop_err:
+                        err_text = str(loop_err)
+                        if ("413" in err_text or "Request too large" in err_text) and response_schema:
+                            print(f"\n  [Context Limit Warning] Reached request size limit on {model}; proceeding to final synthesis...")
+                            parsed_obj, p_in, p_out = await _parse_structured_openai_or_groq(
+                                active_client, model, messages, response_schema
+                            )
+                            in_tok_total += p_in
+                            out_tok_total += p_out
+                            return parsed_obj, in_tok_total, out_tok_total
+                        if "tool_use_failed" in err_text or "Failed to parse tool call arguments" in err_text:
+                            salvaged = _try_salvage_failed_tool_call(loop_err)
+                            if salvaged is not None:
+                                func_name, func_args = salvaged
+                                func_args = cast_tool_arguments(func_name, func_args, mcp_tools_response.tools)
+                                print(f"\n  \033[93m[Agent Action - Salvaged Tool Call]\033[0m Calling tool: \033[1m{func_name}\033[0m")
+                                for k, v in func_args.items():
+                                    print(f"  \033[90m{k}:\033[0m")
+                                    for line in str(v).split('\n'):
+                                        print(f"    \033[36m{line}\033[0m")
+                                try:
+                                    mcp_result = await session.call_tool(func_name, arguments=func_args)
+                                    result = mcp_result.content[0].text
+                                except Exception as tool_e:
+                                    result = f"Error: Tool {func_name} failed: {str(tool_e)}"
+                                print(f"  \033[92m[Agent Action]\033[0m Result generated.")
+                                messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        f"[SYSTEM NOTE: Executed tool `{func_name}` on your behalf. "
+                                        f"Result:\n{result}\nPlease continue.]"
+                                    )
+                                })
+                                continue
+                            elif tool_parse_retries < 3:
+                                tool_parse_retries += 1
+                                print(
+                                    f"\n  [Tool Call Warning] Malformed JSON in tool call on {model}. "
+                                    f"Requesting simpler tool call ({tool_parse_retries}/3)..."
+                                )
+                                messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        "[SYSTEM WARNING: Your previous tool call failed JSON parsing (`tool_use_failed`). "
+                                        "Please retry the tool call with a short 2-3 line snippet, no `#` comments, "
+                                        "and valid JSON escaping.]"
+                                    )
+                                })
+                                continue
+                        raise loop_err
+
                     msg = response.choices[0].message
-                    in_tok_total += response.usage.prompt_tokens
-                    out_tok_total += response.usage.completion_tokens
+                    in_tok_total += response.usage.prompt_tokens if response.usage else 0
+                    out_tok_total += response.usage.completion_tokens if response.usage else 0
                     
                     # 2. Check if LLM wants to use a tool
                     if msg.tool_calls:
@@ -223,12 +543,12 @@ async def run_agent_loop(model: str, mcp_prompt_name: str = None, mcp_prompt_arg
                             
                             print(f"  \033[92m[Agent Action]\033[0m Result generated.")
                             
-                            # Append the result back to messages
+                            # Append the result back to messages (truncated to avoid 413 Request too large)
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tool_call.id,
                                 "name": func_name,
-                                "content": str(result)
+                                "content": str(result)[:3500]
                             })
                         
                         # Loop repeats! LLM sees the tool results and decides what to do next.
@@ -237,16 +557,12 @@ async def run_agent_loop(model: str, mcp_prompt_name: str = None, mcp_prompt_arg
                     else:
                         # 3. No more tool calls! Return final structured output
                         if response_schema:
-                            # To guarantee the Pydantic schema, do one final parse call
-                            # (You could also use strict Structured Outputs above, but keeping it split handles complex tool paths better)
-                            parse_response = await active_client.beta.chat.completions.parse(
-                                model=model,
-                                messages=messages,
-                                response_format=response_schema
+                            parsed_obj, p_in, p_out = await _parse_structured_openai_or_groq(
+                                active_client, model, messages, response_schema
                             )
-                            in_tok_total += parse_response.usage.prompt_tokens
-                            out_tok_total += parse_response.usage.completion_tokens
-                            return parse_response.choices[0].message.parsed, in_tok_total, out_tok_total
+                            in_tok_total += p_in
+                            out_tok_total += p_out
+                            return parsed_obj, in_tok_total, out_tok_total
                         
                         return msg.content, in_tok_total, out_tok_total
             
@@ -485,12 +801,9 @@ async def image_gemini_call(model_name: str, mcp_prompt_name: str = None, mcp_pr
         }]
         try:
             if response_schema:
-                response = await active_client.beta.chat.completions.parse(
-                    model=model_name,
-                    messages=messages,
-                    response_format=response_schema
+                return await _parse_structured_openai_or_groq(
+                    active_client, model_name, messages, response_schema
                 )
-                return response.choices[0].message.parsed, response.usage.prompt_tokens, response.usage.completion_tokens
             else:
                 response = await active_client.chat.completions.create(
                     model=model_name,
@@ -502,12 +815,9 @@ async def image_gemini_call(model_name: str, mcp_prompt_name: str = None, mcp_pr
                 print(f"[API Warning] Model {model_name} does not support vision. Falling back to text-only prompt.")
                 messages[0]["content"] = prompt + "\n(Note: The image could not be analyzed because this model does not support vision. Please reflect on the code instead.)"
                 if response_schema:
-                    response = await active_client.beta.chat.completions.parse(
-                        model=model_name,
-                        messages=messages,
-                        response_format=response_schema
+                    return await _parse_structured_openai_or_groq(
+                        active_client, model_name, messages, response_schema
                     )
-                    return response.choices[0].message.parsed, response.usage.prompt_tokens, response.usage.completion_tokens
                 else:
                     response = await active_client.chat.completions.create(
                         model=model_name,
