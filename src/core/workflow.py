@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shutil
@@ -61,7 +62,8 @@ async def run_workflow(
     image_basename: str = "chart",
     previous_code: str = "",
     requested_resources: list[str] = None,
-    output_dir: str = "."
+    output_dir: str = ".",
+    on_event=None
 ):
     """
     Single-chart generation and reflection pipeline:
@@ -88,6 +90,8 @@ async def run_workflow(
     total_output_tokens = 0
 
     # 1) Generate code (V1)
+    if on_event:
+        on_event({"phase": "chart_v1_start", "chart_id": image_basename})
     utils.print_html(f"Step 1: Generating chart code (V1) for '{image_basename}'… 📈")
     thought_v1, code_v1, in_tok, out_tok = await generate_chart_code(
         instruction=user_instructions,
@@ -110,11 +114,22 @@ async def run_workflow(
     total_output_tokens += out_tok
     utils.print_html(code_v1, title=f"Final successful code (V1 - {image_basename})")
     utils.print_html(out_v1, is_image=True, title=f"Generated Chart (V1 - {image_basename})")
+    if on_event:
+        on_event({
+            "phase": "chart_v1_done",
+            "chart_id": image_basename,
+            "thought_v1": thought_v1,
+            "code_v1": code_v1,
+            "chart_v1": out_v1,
+            "tokens": total_input_tokens + total_output_tokens
+        })
 
     # 3) Reflect on V1 (image + original code) to get feedback and refined code (V2)
     critique = ""
     feedback = ""
     code_v2 = code_v1
+    if on_event:
+        on_event({"phase": "chart_v2_start", "chart_id": image_basename})
     try:
         utils.print_html(f"Step 3: Reflecting on V1 (image + code) for '{image_basename}'… 🔁")
         critique, feedback, code_v2, in_tok, out_tok = await reflect_on_image_and_regenerate(
@@ -149,6 +164,17 @@ async def run_workflow(
             shutil.copyfile(out_v1, out_v2)
         code_v2 = code_v1
 
+    if on_event:
+        on_event({
+            "phase": "chart_v2_done",
+            "chart_id": image_basename,
+            "critique": critique,
+            "feedback": feedback,
+            "code_v2": code_v2,
+            "chart_v2": out_v2,
+            "tokens": total_input_tokens + total_output_tokens
+        })
+
     utils.print_html(
         f"Total Input Tokens: {total_input_tokens:,}\nTotal Output Tokens: {total_output_tokens:,}",
         title=f"Token Usage Report ({image_basename})"
@@ -178,7 +204,9 @@ async def run_full_analysis_workflow(
     generation_model: str = "gemini-4-argon",
     reflection_model: str = "gemini-4-argon",
     max_charts: int = 3,
-    reports_root: str = "reports"
+    reports_root: str = "reports",
+    on_event=None,
+    run_id: str | None = None
 ) -> dict:
     """
     Autonomous End-to-End Data Analysis Pipeline:
@@ -193,7 +221,8 @@ async def run_full_analysis_workflow(
 
     dataset_stem = _sanitize_slug(Path(dataset_path).stem, fallback="dataset")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_dir = Path(reports_root, f"{dataset_stem}_{timestamp}")
+    effective_run_id = run_id or f"{dataset_stem}_{timestamp}"
+    report_dir = Path(reports_root, effective_run_id)
     charts_dir = report_dir / "charts"
     os.makedirs(charts_dir, exist_ok=True)
 
@@ -203,6 +232,8 @@ async def run_full_analysis_workflow(
     # =========================================================================
     # STAGE 1: Automated Data Profiling, Quality Check & Analysis Planning
     # =========================================================================
+    if on_event:
+        on_event({"phase": "stage_1_start", "run_id": effective_run_id, "report_dir": report_dir.as_posix()})
     utils.print_html(
         f"Dataset: {dataset_posix}\nGoal: {user_goal or 'Comprehensive Exploratory & Business Analysis'}\n"
         f"Output Directory: {report_dir.as_posix()}",
@@ -216,6 +247,13 @@ async def run_full_analysis_workflow(
     )
     total_input_tokens += in_tok
     total_output_tokens += out_tok
+    if on_event:
+        on_event({
+            "phase": "stage_1_done",
+            "analysis_plan": analysis_plan.model_dump(),
+            "tokens": in_tok + out_tok,
+            "total_tokens": total_input_tokens + total_output_tokens
+        })
 
     plan_summary_lines = [
         f"Dataset Summary:\n  {analysis_plan.dataset_summary}\n",
@@ -239,6 +277,8 @@ async def run_full_analysis_workflow(
     # =========================================================================
     # STAGE 2: Quantitative & Statistical Exploration
     # =========================================================================
+    if on_event:
+        on_event({"phase": "stage_2_start"})
     utils.print_html(
         "Testing analytical hypotheses quantitatively using MCP statistical tools… 📊",
         title="STAGE 2: Statistical Deep-Dive & Hypothesis Testing"
@@ -251,6 +291,13 @@ async def run_full_analysis_workflow(
     )
     total_input_tokens += in_tok
     total_output_tokens += out_tok
+    if on_event:
+        on_event({
+            "phase": "stage_2_done",
+            "stat_findings": stat_findings.model_dump(),
+            "tokens": in_tok + out_tok,
+            "total_tokens": total_input_tokens + total_output_tokens
+        })
 
     stat_lines = []
     for idx, f in enumerate(stat_findings.findings, 1):
@@ -287,6 +334,10 @@ async def run_full_analysis_workflow(
             title=f"Running Chart Workflow [{safe_id}]"
         )
         try:
+            def _chart_event_proxy(ev, chart_idx=idx, task_obj=task):
+                if on_event:
+                    on_event({**ev, "chart_index": chart_idx, "title": task_obj.title, "rationale": task_obj.rationale})
+
             wf_res = await run_workflow(
                 user_instructions=enriched_instruction,
                 generation_model=generation_model,
@@ -294,7 +345,8 @@ async def run_full_analysis_workflow(
                 image_basename=safe_id,
                 previous_code="",
                 requested_resources=[dataset_posix],
-                output_dir=charts_dir.as_posix()
+                output_dir=charts_dir.as_posix(),
+                on_event=_chart_event_proxy
             )
             total_input_tokens += wf_res["total_input_tokens"]
             total_output_tokens += wf_res["total_output_tokens"]
@@ -304,6 +356,7 @@ async def run_full_analysis_workflow(
                 "title": task.title,
                 "instruction": enriched_instruction,
                 "rationale": task.rationale,
+                "thought_v1": wf_res.get("thought_v1", ""),
                 "chart_v1": wf_res["chart_v1"],
                 "chart_v2": wf_res["chart_v2"],
                 "relative_chart_path": f"charts/{safe_id}_v2.png",
@@ -311,8 +364,11 @@ async def run_full_analysis_workflow(
                 "code_v2": wf_res["code_v2"],
                 "critique": wf_res["critique"],
                 "feedback": wf_res["feedback"],
+                "tokens": wf_res["total_input_tokens"] + wf_res["total_output_tokens"]
             })
         except Exception as chart_err:
+            if on_event:
+                on_event({"phase": "chart_failed", "chart_index": idx, "chart_id": safe_id, "error": str(chart_err)})
             utils.print_html(
                 f"Warning: Chart '{safe_id}' failed after retries and will be skipped so the report can still be generated.\n"
                 f"Reason: {str(chart_err)[:300]}",
@@ -322,6 +378,8 @@ async def run_full_analysis_workflow(
     # =========================================================================
     # STAGE 4: Executive Report Synthesis
     # =========================================================================
+    if on_event:
+        on_event({"phase": "stage_4_start", "total_tokens": total_input_tokens + total_output_tokens})
     utils.print_html(
         "Synthesizing Data Profile, Quantitative Findings, and Reflected Visualizations into report.md… 📝",
         title="STAGE 4: Executive Report Synthesis"
@@ -341,6 +399,38 @@ async def run_full_analysis_workflow(
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report_response.full_markdown_report)
 
+    metadata_payload = {
+        "run_id": effective_run_id,
+        "dataset_path": dataset_posix,
+        "user_goal": user_goal or f"Analyze @{dataset_posix}: Comprehensive exploratory & quantitative analysis",
+        "created_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "status": "COMPLETED",
+        "report_dir": report_dir.as_posix(),
+        "report_path": report_path.as_posix(),
+        "charts_dir": charts_dir.as_posix(),
+        "analysis_plan": analysis_plan.model_dump(),
+        "stat_findings": stat_findings.model_dump(),
+        "chart_results": chart_results,
+        "executive_summary": report_response.executive_summary,
+        "full_markdown_report": report_response.full_markdown_report,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+    }
+    try:
+        with open(report_dir / "run_metadata.json", "w", encoding="utf-8") as mf:
+            json.dump(metadata_payload, mf, indent=2)
+    except Exception:
+        pass
+
+    if on_event:
+        on_event({
+            "phase": "stage_4_done",
+            "executive_summary": report_response.executive_summary,
+            "full_markdown_report": report_response.full_markdown_report,
+            "tokens": in_tok + out_tok,
+            "total_tokens": total_input_tokens + total_output_tokens
+        })
+
     utils.print_html(report_response.executive_summary, title="EXECUTIVE SUMMARY")
     utils.print_html(
         f"Full Markdown Report saved to: {report_path.as_posix()}\n"
@@ -351,6 +441,7 @@ async def run_full_analysis_workflow(
     )
 
     return {
+        "run_id": effective_run_id,
         "dataset_path": dataset_posix,
         "user_goal": user_goal,
         "report_dir": report_dir.as_posix(),

@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ChartAgent — Autonomous Data Analysis Studio</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            canvas: '#070709',
+            panel: '#0b0c10',
+            card: '#121318',
+            borderDark: '#1e2029',
+          },
+          fontFamily: {
+            sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
+            mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
+          }
+        }
+      }
+    };
+  </script>
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <!-- React 18 & Babel Standalone -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Marked for Markdown rendering -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      padding: 0;
+      background-color: #070709;
+      color: #e4e4e7;
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      overflow: hidden;
+      user-select: none;
+    }
+    /* Custom subtle scrollbars */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0b0c10;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #232634;
+      border-radius: 3px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #34384d;
+    }
+    /* Subtle dot-grid canvas background matching screenshot */
+    .dag-canvas-bg {
+      background-color: #070709;
+      background-image: radial-gradient(#191b24 1px, transparent 1px);
+      background-size: 24px 24px;
+    }
+    /* Animated flow line for running edges */
+    @keyframes dashFlow {
+      to {
+        stroke-dashoffset: -24;
+      }
+    }
+    .edge-running {
+      stroke-dasharray: 6 6;
+      animation: dashFlow 0.8s linear infinite;
+    }
+    /* Markdown Report Styling */
+    .markdown-body h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #f4f4f5;
+      margin-bottom: 1rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid #222530;
+    }
+    .markdown-body h2 {
+      font-size: 1.18rem;
+      font-weight: 600;
+      color: #a5b4fc;
+      margin-top: 1.6rem;
+      margin-bottom: 0.75rem;
+    }
+    .markdown-body h3 {
+      font-size: 1rem;
+      font-weight: 600;
+      color: #34d399;
+      margin-top: 1.25rem;
+      margin-bottom: 0.5rem;
+    }
+    .markdown-body p, .markdown-body li {
+      font-size: 0.9rem;
+      line-height: 1.65;
+      color: #d4d4d8;
+    }
+    .markdown-body ul, .markdown-body ol {
+      padding-left: 1.4rem;
+      margin-bottom: 1rem;
+    }
+    .markdown-body ul {
+      list-style-type: disc;
+    }
+    .markdown-body ol {
+      list-style-type: decimal;
+    }
+    .markdown-body hr {
+      border-color: #1f222d;
+      margin: 1.5rem 0;
+    }
+    .markdown-body code {
+      background: #161822;
+      color: #93c5fd;
+      padding: 0.15rem 0.4rem;
+      border-radius: 4px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+    }
+    .markdown-body table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1rem 0;
+      font-size: 0.85rem;
+      background: #0d0e14;
+      border: 1px solid #232634;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .markdown-body th {
+      background: #151722;
+      color: #a1a1aa;
+      font-weight: 600;
+      text-align: left;
+      padding: 0.65rem 0.9rem;
+      border-bottom: 1px solid #232634;
+    }
+    .markdown-body td {
+      padding: 0.6rem 0.9rem;
+      border-bottom: 1px solid #191b26;
+      color: #e4e4e7;
+    }
+    .markdown-body img {
+      max-width: 100%;
+      border-radius: 10px;
+      border: 1px solid #262936;
+      margin: 1rem 0;
+      background: #fff;
+      padding: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" src="/ui/app.jsx"></script>
+</body>
+</html>

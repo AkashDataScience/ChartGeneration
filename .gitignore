@@ -22,3 +22,4 @@ venv.bak/
 # Jupyter
 .ipynb_checkpoints
 data/
+reports/
