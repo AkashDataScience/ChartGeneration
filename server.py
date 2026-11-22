@@ -663,6 +663,17 @@ async def api_get_run(request: Request):
             return JSONResponse({"error": f"Run '{run_id}' not found"}, status_code=404)
 
     rdata = ACTIVE_RUNS[run_id]
+    # Always read the live report.md from disk if it exists so manual edits to report.md show immediately
+    report_md_file = REPORTS_DIR / run_id / "report.md"
+    if report_md_file.exists():
+        try:
+            with open(report_md_file, "r", encoding="utf-8") as rf:
+                live_md = rf.read()
+                if live_md.strip():
+                    rdata["full_markdown_report"] = live_md
+        except Exception:
+            pass
+
     dag = _build_dag_for_run(rdata)
     tot_tokens = int(rdata.get("total_input_tokens", 0)) + int(rdata.get("total_output_tokens", 0))
     return JSONResponse({
@@ -780,6 +791,9 @@ async def api_create_run(request: Request):
             run_record["total_input_tokens"] = res["total_input_tokens"]
             run_record["total_output_tokens"] = res["total_output_tokens"]
         except Exception as err:
+            import traceback
+            tb_str = traceback.format_exc()
+            print(f"\n[Run Failed] {run_id}: {err}\n{tb_str}")
             run_record["status"] = "FAILED"
             run_record["error"] = str(err)
 

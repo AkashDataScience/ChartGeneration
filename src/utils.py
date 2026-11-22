@@ -41,6 +41,8 @@ from mcp.client.session import ClientSession
 
 FALLBACK_MODELS = [
     "gemini-4-argon",
+    "gemini-4-hydrogen",
+    "gemini-4-neon",
     "gemini-3.6-flash",
     "gemini-3.8-flash",
     "gpt-4o-mini",
@@ -53,6 +55,35 @@ FALLBACK_MODELS = [
 # Track models that hit quota/credit exhaustion so subsequent calls skip straight to a working model
 _EXHAUSTED_MODELS: set[str] = set()
 _LAST_WORKING_MODEL: str | None = None
+
+
+async def _gemini_generate_with_backoff(model: str, contents, config):
+    """
+    Call client.aio.models.generate_content with in-place exponential backoff for transient
+    503 UNAVAILABLE ('high demand') / 502 / 504 errors so multi-turn tool loops do not lose progress.
+    """
+    max_attempts = 4
+    for attempt in range(max_attempts):
+        try:
+            return await client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config
+            )
+        except Exception as err:
+            err_str = str(err)
+            is_transient = any(
+                t in err_str for t in ("503", "502", "504", "500", "UNAVAILABLE", "high demand", "overloaded", " temporarily ")
+            )
+            if is_transient and attempt < max_attempts - 1:
+                wait_s = 2 * (attempt + 1)
+                print(
+                    f"\n  [Gemini 503 Backoff] {model} experiencing high demand. "
+                    f"Retrying in-place in {wait_s}s ({attempt + 1}/{max_attempts - 1})..."
+                )
+                await asyncio.sleep(wait_s)
+                continue
+            raise err
 
 
 def sanitize_python_code(code: str) -> str:
@@ -180,8 +211,9 @@ def with_retries(func):
                         _set_model(current_model)
                         break
 
-        retries = 10  # Give it a few attempts to cascade down the models
+        retries = 12  # Give it attempts for transient 503 retries + model fallbacks
         backoff = 2
+        same_model_503_count = 0
         
         for attempt in range(retries):
             try:
@@ -195,10 +227,40 @@ def with_retries(func):
                         return " | ".join(get_error_str(sub_e) for sub_e in err.exceptions)
                     return str(err)
                 error_str = get_error_str(e)
+
+                # Catch expired or invalid API key errors explicitly, log clearly, and do NOT skip/hide them
+                auth_error_tokens = (
+                    "Error code: 401", "'code': 401", "'status': 401", "UNAUTHENTICATED",
+                    "AuthenticationError", "expired_secret_key", "invalid_api_key", "API_KEY_INVALID"
+                )
+                if any(auth_tok in error_str for auth_tok in auth_error_tokens):
+                    print(f"\n[API Error] Received {error_str[:120]}... on {current_model}")
+                    print(f"-> API key expired or invalid for {current_model}. Stopping execution (please update your API key in .env).")
+                    raise e
                 
-                retryable_tokens = ("503", "429", "404", "413", "Request too large", "tool_use_failed", "json_validate_failed", "rate_limit")
+                retryable_tokens = (
+                    "503", "502", "500", "504", "429", "404", "413", "400",
+                    "Request too large", "tool_use_failed", "json_validate_failed",
+                    "rate_limit", "UNAVAILABLE", "overloaded", "ValidationError",
+                    "validation error", "timeout", "TimedOut"
+                )
                 if any(tok in error_str for tok in retryable_tokens) and attempt < retries - 1:
-                    print(f"\n[API Warning] Received {error_str[:80]}... on {current_model}")
+                    print(f"\n[API Warning] Received {error_str[:110]}... on {current_model}")
+
+                    # If it's a temporary 503 / 502 / 504 server overload (not 429 quota or 404 missing),
+                    # retry the SAME working model up to 3 times with backoff before switching models!
+                    is_transient_overload = (
+                        any(t in error_str for t in ("503", "502", "504", "UNAVAILABLE", "high demand", "overloaded"))
+                        and not any(q in error_str for q in ("429", "404", "no credits", "RESOURCE_EXHAUSTED"))
+                    )
+                    if is_transient_overload and same_model_503_count < 3:
+                        same_model_503_count += 1
+                        wait_s = 2 * same_model_503_count
+                        print(f"-> Transient 503 overload on {current_model}. Retrying {current_model} in {wait_s}s ({same_model_503_count}/3)...")
+                        await asyncio.sleep(wait_s)
+                        continue
+
+                    same_model_503_count = 0
                     if any(q in error_str for q in ("429", "404", "no credits", "RESOURCE_EXHAUSTED")):
                         _EXHAUSTED_MODELS.add(current_model)
                     
@@ -324,17 +386,17 @@ async def _parse_structured_openai_or_groq(
             role = m.get("role", "user")
             content = str(m.get("content", ""))
             if role == "user" and not base_user_prompt:
-                base_user_prompt = content[:18000]
+                base_user_prompt = content[:9000]
             elif role == "tool":
-                tool_summaries.append(f"[{m.get('name', 'tool')}]:\n{content[:1800]}")
+                tool_summaries.append(f"[{m.get('name', 'tool')}]:\n{content[:1200]}")
             elif role == "user" and "[SYSTEM NOTE:" in content:
-                tool_summaries.append(content[:1800])
+                tool_summaries.append(content[:1200])
             elif role == "assistant" and content:
-                last_assistant_text = content[:3000]
+                last_assistant_text = content[:2000]
         else:
             content = getattr(m, "content", None)
             if content:
-                last_assistant_text = str(content)[:3000]
+                last_assistant_text = str(content)[:2000]
 
     combined_context = base_user_prompt
     if tool_summaries:
@@ -588,8 +650,11 @@ async def run_agent_loop(model: str, mcp_prompt_name: str = None, mcp_prompt_arg
                     tools=[{"function_declarations": [t["function"] for t in gemini_tools]}]
                 )
                 
+                gemini_tool_turns = 0
+                max_gemini_tool_turns = 6
+
                 while True:
-                    response = await client.aio.models.generate_content(
+                    response = await _gemini_generate_with_backoff(
                         model=model,
                         contents=gemini_contents,
                         config=config
@@ -598,7 +663,8 @@ async def run_agent_loop(model: str, mcp_prompt_name: str = None, mcp_prompt_arg
                     in_tok_total += response.usage_metadata.prompt_token_count if response.usage_metadata else 0
                     out_tok_total += response.usage_metadata.candidates_token_count if response.usage_metadata else 0
                     
-                    if response.function_calls:
+                    if response.function_calls and gemini_tool_turns < max_gemini_tool_turns:
+                        gemini_tool_turns += 1
                         # ---------------------------------------------------------
                         # WORKAROUND: Bypassing GenAI SDK 'thought_signature' Bug
                         # The SDK drops the thought_signature field, breaking the proxy 
@@ -637,7 +703,7 @@ async def run_agent_loop(model: str, mcp_prompt_name: str = None, mcp_prompt_arg
                                 result = f"Error: Tool {func_name} failed: {str(e)}"
                                 
                             print(f"  \033[92m[Agent Action - Gemini]\033[0m Result generated.")
-                            tool_results_text += f"\n--- Result from {func_name} ---\n{str(result)}\n"
+                            tool_results_text += f"\n--- Result from {func_name} ---\n{str(result)[:3500]}\n"
                         
                         tool_results_text += "Please continue fulfilling the original instruction using this new information.]\n"
                         
@@ -654,25 +720,43 @@ async def run_agent_loop(model: str, mcp_prompt_name: str = None, mcp_prompt_arg
                         
                     else:
                         # No more tool calls! Return final structured output
+                        draft_text = ""
+                        try:
+                            draft_text = response.text or ""
+                        except Exception:
+                            draft_text = ""
+
                         if response_schema:
                             config_schema = types.GenerateContentConfig(
                                 response_mime_type="application/json",
                                 response_schema=response_schema
                             )
-                            # Force Gemini to map its final thoughts into the structured JSON schema
-                            gemini_contents.append(response.candidates[0].content)
-                            gemini_contents.append(types.Content(role="user", parts=[types.Part.from_text(text="Please output your final response exactly matching the requested JSON schema.")]))
+                            # Build a clean single-turn user prompt containing the accumulated tool results + draft thoughts
+                            # so we never send a raw model Content with a dropped `thought_signature` back to the proxy!
+                            final_user_text = messages[-1]["content"]
+                            if draft_text:
+                                final_user_text += f"\n\n[YOUR DRAFT ANALYSIS]:\n{draft_text}"
+                            final_user_text += "\n\nPlease output your final response strictly matching the requested JSON schema."
+
+                            clean_schema_contents = [
+                                types.Content(role="user", parts=[types.Part.from_text(text=final_user_text)])
+                            ]
                             
-                            parse_response = await client.aio.models.generate_content(
+                            parse_response = await _gemini_generate_with_backoff(
                                 model=model,
-                                contents=gemini_contents,
+                                contents=clean_schema_contents,
                                 config=config_schema
                             )
                             in_tok_total += parse_response.usage_metadata.prompt_token_count if parse_response.usage_metadata else 0
                             out_tok_total += parse_response.usage_metadata.candidates_token_count if parse_response.usage_metadata else 0
-                            return parse_response.parsed, in_tok_total, out_tok_total
+                            if parse_response.parsed is not None:
+                                return parse_response.parsed, in_tok_total, out_tok_total
+                            raw_json = (parse_response.text or "{}").strip()
+                            if raw_json.startswith("```"):
+                                raw_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_json, flags=re.DOTALL).strip()
+                            return response_schema.model_validate_json(raw_json), in_tok_total, out_tok_total
                         
-                        return response.text, in_tok_total, out_tok_total
+                        return draft_text, in_tok_total, out_tok_total
 
 @with_retries
 async def get_response(model: str, prompt: str, response_schema: type[BaseModel] | None = None):
@@ -834,7 +918,7 @@ async def image_gemini_call(model_name: str, mcp_prompt_name: str = None, mcp_pr
         config.response_mime_type = "application/json"
         config.response_schema = response_schema
         
-    response = await client.aio.models.generate_content(
+    response = await _gemini_generate_with_backoff(
         model=model_name,
         contents=[image, prompt],
         config=config

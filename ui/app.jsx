@@ -131,8 +131,23 @@ const Icons = {
 };
 
 function rewriteReportImagePaths(mdText, runId) {
-  if (!mdText) return "";
-  return mdText.replace(/!\[([^\]]*)\]\((?!http|\/)(charts\/[^)]+)\)/g, `![$1](/reports/${runId}/$2)`);
+  if (!mdText || !runId) return mdText || "";
+  return mdText.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, rawUrl) => {
+    let url = rawUrl.trim().replace(/^\.\/+/, "");
+    if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("/reports/")) {
+      return `![${alt}](${url})`;
+    }
+    if (url.startsWith("reports/")) {
+      return `![${alt}](/${url})`;
+    }
+    // Extract filename if it's charts/foo.png or bare foo.png
+    let filename = url.startsWith("charts/") ? url.slice("charts/".length) : url;
+    // If LLM wrote chart_id.png instead of chart_id_v2.png, normalize to _v2.png
+    if (filename.endsWith(".png") && !filename.endsWith("_v1.png") && !filename.endsWith("_v2.png")) {
+      filename = filename.slice(0, -4) + "_v2.png";
+    }
+    return `![${alt}](/reports/${runId}/charts/${filename})`;
+  });
 }
 
 /* ==================== MAIN APP COMPONENT ==================== */

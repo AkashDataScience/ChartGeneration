@@ -198,6 +198,29 @@ def _sanitize_slug(name: str, fallback: str = "chart") -> str:
     return slug or fallback
 
 
+def _normalize_report_chart_links(md_text: str, chart_results: list[dict]) -> str:
+    """
+    Ensure any Markdown image reference like `![...](chart_id.png)` or `![...](charts/chart_id.png)`
+    is normalized to `![...](charts/<chart_id>_v2.png)`.
+    """
+    if not md_text:
+        return ""
+    known_ids = {c["chart_id"] for c in (chart_results or []) if c.get("chart_id")}
+
+    def _repl(match):
+        alt, raw_url = match.group(1), match.group(2).strip()
+        clean = raw_url.lstrip("./")
+        fname = clean[len("charts/"):] if clean.startswith("charts/") else clean
+        stem = fname[:-4] if fname.endswith(".png") else fname
+        if stem in known_ids:
+            return f"![{alt}](charts/{stem}_v2.png)"
+        if fname.endswith("_v2.png") or fname.endswith("_v1.png"):
+            return f"![{alt}](charts/{fname})"
+        return match.group(0)
+
+    return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", _repl, md_text)
+
+
 async def run_full_analysis_workflow(
     dataset_path: str,
     user_goal: str = "",
@@ -395,6 +418,9 @@ async def run_full_analysis_workflow(
     total_input_tokens += in_tok
     total_output_tokens += out_tok
 
+    report_response.full_markdown_report = _normalize_report_chart_links(
+        report_response.full_markdown_report, chart_results
+    )
     report_path = report_dir / "report.md"
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report_response.full_markdown_report)
